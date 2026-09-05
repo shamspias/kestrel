@@ -72,7 +72,10 @@ def write_coco_gt(recs: List[Dict], path: str) -> Dict[str, int]:
             anns.append(dict(id=len(anns) + 1, image_id=k, category_id=int(l) + 1, bbox=[x1, y1, x2 - x1, y2 - y1],
                              area=(x2 - x1) * (y2 - y1), iscrowd=int(d), ignore=int(d)))
     cats = [dict(id=i + 1, name=c) for i, c in enumerate(VOC_CLASSES)]
-    json.dump(dict(images=images, annotations=anns, categories=cats), open(path, "w"))
+    tmp = f"{path}.{os.getpid()}.tmp"                    # atomic replace: concurrent readers never see a truncated file
+    with open(tmp, "w") as f:
+        json.dump(dict(images=images, annotations=anns, categories=cats), f)
+    os.replace(tmp, path)
     return id_map
 
 

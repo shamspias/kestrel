@@ -227,7 +227,8 @@ def build_denoising(gt: Dict, num_classes: int, groups: int, box_noise: float = 
     # label noise on positives
     flip = (torch.rand(B, boxes.shape[1], device=dev) < label_noise) & positive
     labels = torch.where(flip, torch.randint(0, num_classes, labels.shape, device=dev), labels)
-    labels = torch.where(positive, labels, torch.full_like(labels, num_classes))   # negatives get the 'no-object' embedding
+    labels = torch.where(valid, labels, torch.full_like(labels, num_classes))      # padding slots only get the spare embedding;
+    # negatives keep the (noised) class label like positives, so content does not reveal which queries are negatives (DINO CDN)
     # box noise: positives jitter within ±box_noise·(w/2,h/2); negatives in the ring [1, 2]×
     c = box_cxcywh(boxes)
     half = c[..., 2:] / 2

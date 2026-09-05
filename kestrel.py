@@ -522,13 +522,16 @@ class QuerySelector(nn.Module):
         self.proj = nn.Linear(feat_dim, d)
         self.tgt = nn.Parameter(torch.randn(num_queries, d) * 0.02)
 
-    def forward(self, dense: Dict[str, torch.Tensor], logits: torch.Tensor, k: Optional[int] = None):
+    def forward(self, dense: Dict[str, torch.Tensor], logits: torch.Tensor, k: Optional[int] = None, detach: bool = False):
         k = k or self.k
         score = dense["quality"].sigmoid() * logits.sigmoid().amax(-1)
         idx = score.topk(k, dim=1).indices                                  # (B, K)
         gather = lambda t: t.gather(1, idx[..., None].expand(-1, -1, t.shape[-1]))
-        q = self.proj(gather(dense["feat"])) + self.tgt[:k][None]
-        return q, gather(dense["boxes"]), gather(logits), idx
+        feat, boxes = gather(dense["feat"]), gather(dense["boxes"])
+        if detach:                                                          # cut the graph UPSTREAM of the projection so proj/tgt still train
+            feat, boxes = feat.detach(), boxes.detach()
+        q = self.proj(feat) + self.tgt[:k][None]
+        return q, boxes, gather(logits), idx
 
 
 # ----------------------------------------------------------------------------------------------
@@ -704,7 +707,8 @@ class DecoderLayer(nn.Module):
 class AnytimeDecoder(nn.Module):
     def __init__(self, cfg: KestrelConfig, vocab: Vocabulary):
         super().__init__()
-        self.cfg, self.vocab = cfg, vocab
+        self.cfg = cfg
+        object.__setattr__(self, "vocab", vocab)          # shared with KESTREL.vocab; not registered twice (state_dict / EMA)
         self.layers = nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg.dec_layers)])
         self.fdr = FDR(cfg.fdr_bins, cfg.fdr_scale)
         self.pos_mlp = nn.Sequential(nn.Linear(4 * 64, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model))
@@ -916,9 +920,7 @@ class KESTREL(nn.Module):
 
         dense = self.dense(feats)
         dense_logits = self.vocab(dense["region"])
-        q, box_init, init_logits, idx = self.select(dense, dense_logits, num_queries)
-        if self.cfg.detach_seeds:
-            q, box_init = q.detach(), box_init.detach()
+        q, box_init, init_logits, idx = self.select(dense, dense_logits, num_queries, detach=self.cfg.detach_seeds)
         K = q.shape[1]
         # training: contrastive denoising queries appended after the detection queries
         sa_mask = None

@@ -66,7 +66,7 @@ class TaskAlignedAssigner:
         # --- resolve anchors claimed by several gts: keep the highest IoU
         multi = cand.sum(1) > 1                                                           # (B, N)
         if multi.any():
-            best = ious.argmax(1)                                                          # (B, N)
+            best = (ious * cand).argmax(1)                                                 # (B, N) highest IoU among CLAIMANT gts only
             one_hot = F.one_hot(best, M).permute(0, 2, 1).bool()
             cand = torch.where(multi[:, None, :], one_hot & cand.any(1, keepdim=True), cand)
         fg = cand.any(1)                                                                   # (B, N)
