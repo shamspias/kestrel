@@ -82,6 +82,12 @@ class KestrelConfig:
     exit_bg: float = 0.05                        # confident background
     exit_u: float = 0.15                         # normalised localisation entropy
     exit_min_layers: int = 2
+    # ablation / training switches
+    local_attn: str = "roi"                      # "roi" (RoI-gathered, export-native) | "deform" (multi-scale deformable)
+    deform_points: int = 4
+    use_presence: bool = True                    # gate query scores with the presence head
+    detach_seeds: bool = True                    # detach seed boxes/content before the decoder (train stability)
+    ls_init: float = 1e-2                        # LayerScale init for conv/attention residual branches
 
     @property
     def strides(self) -> Tuple[int, int, int]:
@@ -229,24 +235,24 @@ class GRN(nn.Module):
 class ConvBlock(nn.Module):
     """DW7x7(reparam,+BN) → 1x1 expand → GELU → GRN → 1x1 project, LayerScale residual."""
 
-    def __init__(self, c, mlp_ratio=3):
+    def __init__(self, c, mlp_ratio=3, ls_init=1e-2):
         super().__init__()
         self.dw = DilatedRepDW(c)
         self.pw1 = nn.Conv2d(c, c * mlp_ratio, 1)
         self.act = nn.GELU()
         self.grn = GRN(c * mlp_ratio)
         self.pw2 = nn.Conv2d(c * mlp_ratio, c, 1)
-        self.ls = nn.Parameter(1e-2 * torch.ones(c, 1, 1))
+        self.ls = nn.Parameter(ls_init * torch.ones(c, 1, 1))
 
     def forward(self, x):
         return x + self.ls * self.pw2(self.grn(self.act(self.pw1(self.dw(x)))))
 
 
 class ConvStage(nn.Module):
-    def __init__(self, cin, c, depth, mlp_ratio, down: bool):
+    def __init__(self, cin, c, depth, mlp_ratio, down: bool, ls_init=1e-2):
         super().__init__()
         self.down = RepConv(cin, c, 3, 2) if down else nn.Identity()
-        self.blocks = nn.Sequential(*[ConvBlock(c, mlp_ratio) for _ in range(depth)])
+        self.blocks = nn.Sequential(*[ConvBlock(c, mlp_ratio, ls_init) for _ in range(depth)])
 
     def forward(self, x):
         return self.blocks(self.down(x))
@@ -296,17 +302,17 @@ class SwiGLU(nn.Module):
 class AttnBlock(nn.Module):
     """Pre-RMSNorm attention block with QK-norm, 2-D RoPE, SwiGLU and LayerScale."""
 
-    def __init__(self, d, head_dim=32):
+    def __init__(self, d, head_dim=32, ls_init=1e-2):
         super().__init__()
         self.h, self.dh = d // head_dim, head_dim
         self.n1 = RMSNorm(d)
         self.qkv = nn.Linear(d, 3 * d)
         self.qn, self.kn = RMSNorm(head_dim), RMSNorm(head_dim)
         self.proj = nn.Linear(d, d)
-        self.ls1 = nn.Parameter(1e-2 * torch.ones(d))
+        self.ls1 = nn.Parameter(ls_init * torch.ones(d))
         self.n2 = RMSNorm(d)
         self.ffn = SwiGLU(d)
-        self.ls2 = nn.Parameter(1e-2 * torch.ones(d))
+        self.ls2 = nn.Parameter(ls_init * torch.ones(d))
 
     def attend(self, x, cos, sin, mask=None):
         B, T, _ = x.shape
@@ -355,10 +361,10 @@ class AttnBlock(nn.Module):
 class AttnStage(nn.Module):
     """Patch-merge downsample → depth × AttnBlock. window=None ⇒ all-global."""
 
-    def __init__(self, cin, d, depth, head_dim, window: Optional[int], global_every: int, n_registers: int, reg_in: Optional[int]):
+    def __init__(self, cin, d, depth, head_dim, window: Optional[int], global_every: int, n_registers: int, reg_in: Optional[int], ls_init=1e-2):
         super().__init__()
         self.down = nn.Conv2d(cin, d, 2, 2)
-        self.blocks = nn.ModuleList([AttnBlock(d, head_dim) for _ in range(depth)])
+        self.blocks = nn.ModuleList([AttnBlock(d, head_dim, ls_init) for _ in range(depth)])
         self.window = window
         self.is_global = [window is None or (i % global_every == global_every - 1) or i == depth - 1 for i in range(depth)]
         self.registers = nn.Parameter(torch.randn(1, n_registers, d) * 0.02) if reg_in is None else None
@@ -625,12 +631,61 @@ class RoICrossAttention(nn.Module):
         return self.out(o.transpose(1, 2).reshape(B, K, d))
 
 
+class DeformCrossAttention(nn.Module):
+    """Multi-scale deformable attention (Deformable DETR / DINO, box-modulated offsets) in pure PyTorch with
+    grid_sample — the ablation baseline for RoICrossAttention. Values are projected per layer over the whole maps."""
+
+    def __init__(self, d, heads, n_levels, n_points, strides):
+        super().__init__()
+        self.h, self.dh, self.L, self.P, self.strides = heads, d // heads, n_levels, n_points, strides
+        self.offset = nn.Linear(d, heads * n_levels * n_points * 2)
+        self.attn = nn.Linear(d, heads * n_levels * n_points)
+        self.value = nn.ModuleList([nn.Conv2d(2 * d, d, 1) for _ in range(n_levels)])   # takes the shared K/V maps (2d) → values
+        self.out = nn.Linear(d, d)
+        nn.init.zeros_(self.offset.weight)
+        th = torch.arange(heads, dtype=torch.float32) * (2.0 * math.pi / heads)
+        grid = torch.stack([th.cos(), th.sin()], -1)
+        grid = (grid / grid.abs().max(-1, keepdim=True)[0]).view(heads, 1, 1, 2).repeat(1, n_levels, n_points, 1)
+        for i in range(n_points):
+            grid[:, :, i, :] *= i + 1
+        with torch.no_grad():
+            self.offset.bias.copy_(grid.view(-1))
+        nn.init.zeros_(self.attn.weight); nn.init.zeros_(self.attn.bias)
+
+    def forward(self, q, boxes, kv_maps):
+        B, K, d = q.shape
+        H_img = None
+        off = self.offset(q).view(B, K, self.h, self.L, self.P, 2)
+        w = self.attn(q).view(B, K, self.h, self.L * self.P).softmax(-1).view(B, K, self.h, self.L, self.P)
+        c = torch.stack([(boxes[..., 0] + boxes[..., 2]) / 2, (boxes[..., 1] + boxes[..., 3]) / 2], -1)      # (B, K, 2) px
+        wh = torch.stack([boxes[..., 2] - boxes[..., 0], boxes[..., 3] - boxes[..., 1]], -1).clamp(min=1.0)
+        loc = c[:, :, None, None, None, :] + off * wh[:, :, None, None, None, :] / (2 * self.P)                  # (B,K,h,L,P,2) px
+        outs = []
+        for l, (f, s) in enumerate(zip(kv_maps, self.strides)):
+            v = self.value[l](f)                                                                                  # (B, d, Hl, Wl)
+            Hl, Wl = v.shape[-2:]
+            v = v.view(B * self.h, self.dh, Hl, Wl)
+            g = loc[:, :, :, l]                                                                                    # (B, K, h, P, 2)
+            g = torch.stack([g[..., 0] / (Wl * s) * 2 - 1, g[..., 1] / (Hl * s) * 2 - 1], -1)                    # normalised
+            g = g.permute(0, 2, 1, 3, 4).reshape(B * self.h, K, self.P, 2)
+            samp = F.grid_sample(v, g, mode="bilinear", padding_mode="zeros", align_corners=False)               # (B*h, dh, K, P)
+            outs.append(samp.view(B, self.h, self.dh, K, self.P))
+        samp = torch.cat(outs, -1)                                                                                # (B, h, dh, K, L*P)
+        w = w.permute(0, 2, 1, 3, 4).reshape(B, self.h, 1, K, self.L * self.P)
+        o = (samp * w).sum(-1).permute(0, 3, 1, 2).reshape(B, K, d)
+        return self.out(o)
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: KestrelConfig):
         super().__init__()
         d, h = cfg.d_model, cfg.dec_heads
         self.n1, self.sa = RMSNorm(d), nn.MultiheadAttention(d, h, batch_first=True)
-        self.n2, self.roi_xa = RMSNorm(d), RoICrossAttention(d, h, cfg.roi_grid, len(cfg.strides), cfg.roi_context, cfg.strides)
+        self.n2 = RMSNorm(d)
+        if cfg.local_attn == "deform":
+            self.roi_xa = DeformCrossAttention(d, h, len(cfg.strides), cfg.deform_points, cfg.strides)
+        else:
+            self.roi_xa = RoICrossAttention(d, h, cfg.roi_grid, len(cfg.strides), cfg.roi_context, cfg.strides)
         self.n3, self.glob_xa = RMSNorm(d), nn.MultiheadAttention(d, h, batch_first=True)
         self.n4, self.ffn = RMSNorm(d), SwiGLU(d)
         self.delta_fdr = nn.Linear(d, 4 * cfg.fdr_bins)
@@ -812,10 +867,10 @@ class KESTREL(nn.Module):
         c4, c8 = cfg.conv_dims
         d16, d32 = cfg.attn_dims
         self.stem = nn.Sequential(RepConv(cfg.in_ch, cfg.stem_ch, 3, 2), RepConv(cfg.stem_ch, c4, 3, 2))
-        self.s4 = ConvStage(c4, c4, cfg.conv_depths[0], cfg.conv_mlp_ratio, down=False)
-        self.s8 = ConvStage(c4, c8, cfg.conv_depths[1], cfg.conv_mlp_ratio, down=True)
-        self.s16 = AttnStage(c8, d16, cfg.attn_depths[0], cfg.head_dim, cfg.window, cfg.global_every, cfg.n_registers, reg_in=None)
-        self.s32 = AttnStage(d16, d32, cfg.attn_depths[1], cfg.head_dim, None, cfg.global_every, cfg.n_registers, reg_in=d16)
+        self.s4 = ConvStage(c4, c4, cfg.conv_depths[0], cfg.conv_mlp_ratio, down=False, ls_init=cfg.ls_init)
+        self.s8 = ConvStage(c4, c8, cfg.conv_depths[1], cfg.conv_mlp_ratio, down=True, ls_init=cfg.ls_init)
+        self.s16 = AttnStage(c8, d16, cfg.attn_depths[0], cfg.head_dim, cfg.window, cfg.global_every, cfg.n_registers, reg_in=None, ls_init=cfg.ls_init)
+        self.s32 = AttnStage(d16, d32, cfg.attn_depths[1], cfg.head_dim, None, cfg.global_every, cfg.n_registers, reg_in=d16, ls_init=cfg.ls_init)
         # temporal context: zero-initialised gate ⇒ the single-image model is unchanged when no memory is given
         self.temporal_xa = nn.MultiheadAttention(d32, d32 // cfg.head_dim, batch_first=True)
         self.temporal_gate = nn.Parameter(torch.zeros(1))
@@ -829,6 +884,7 @@ class KESTREL(nn.Module):
         self.mask_head = MaskHead(cfg.neck_dim, cfg.d_model, cfg.mask_dim)
         self.kpt_head = KeypointHead(cfg.neck_dim, cfg.d_model, cfg.num_keypoints, cfg.kpt_bins, cfg.kpt_roi)
         self.slots = SlotMemory(cfg.d_model, cfg.slots)
+        self.dn_embed = nn.Embedding(cfg.num_classes + 1, cfg.d_model)             # denoising content queries (training only)
 
     # ----- backbone --------------------------------------------------------------------------
     def backbone(self, images, prev_mem: Optional[torch.Tensor] = None):
@@ -850,7 +906,7 @@ class KESTREL(nn.Module):
     # ----- full forward ----------------------------------------------------------------------
     def forward(self, images: torch.Tensor, anytime: bool = False, state: Optional[dict] = None,
                 return_masks: bool = True, return_kpts: bool = False, max_layers: Optional[int] = None,
-                num_queries: Optional[int] = None) -> Dict[str, torch.Tensor]:
+                num_queries: Optional[int] = None, dn: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         B, _, H, W = images.shape
         assert H % 32 == 0 and W % 32 == 0, "input sides must be multiples of 32"
         prev_mem = state.get("scene_mem") if state else None
@@ -861,10 +917,17 @@ class KESTREL(nn.Module):
         dense = self.dense(feats)
         dense_logits = self.vocab(dense["region"])
         q, box_init, init_logits, idx = self.select(dense, dense_logits, num_queries)
+        if self.cfg.detach_seeds:
+            q, box_init = q.detach(), box_init.detach()
         K = q.shape[1]
+        # training: contrastive denoising queries appended after the detection queries
+        sa_mask = None
+        if dn is not None:
+            q = torch.cat([q, self.dn_embed(dn["labels"])], 1)
+            box_init = torch.cat([box_init, dn["boxes"]], 1)
+            sa_mask = dn["attn_mask"]
 
         # video: append alive slots as track queries (dead slots masked out of self-attention)
-        sa_mask = None
         if state is not None:
             q = torch.cat([q, state["emb"] + self.slots.slot_pos], 1)
             box_init = torch.cat([box_init, torch.where(state["alive"][..., None], state["box"], box_init[:, :1].expand(-1, self.cfg.slots, -1))], 1)
@@ -872,18 +935,25 @@ class KESTREL(nn.Module):
             sa_mask = dead[:, None, None, :].expand(-1, self.cfg.dec_heads, q.shape[1], -1).reshape(B * self.cfg.dec_heads, q.shape[1], -1)
 
         out: Dict[str, torch.Tensor] = dict(dense_logits=dense_logits, dense_boxes=dense["boxes"], dense_quality=dense["quality"],
-                                            query_idx=idx, init_logits=init_logits)
+                                            dense_anchors=dense["anchors"], dense_strides=dense["strides"], query_idx=idx,
+                                            init_logits=init_logits, box_init=box_init[:, :K])
         if anytime and not self.training and state is None:
             final = self.decoder.forward_anytime(q, box_init, feats, mem, mem_pos, (H, W))
             out["exit_layer"] = final["exit_layer"]
         else:
             layers = self.decoder(q, box_init, feats, mem, mem_pos, (H, W), sa_mask, max_layers)
+            if dn is not None:                                                             # split off the denoising part
+                out["dn_layers"] = [{k: v[:, K:] for k, v in l.items()} for l in layers]
+                out["dn"] = dn
+                layers = [{k: v[:, :K] for k, v in l.items()} for l in layers]
             out["aux"] = layers[:-1]
             final = layers[-1]
 
         presence = self.presence(self.vocab.embeddings, self.decoder.mem_proj(mem))       # (B, C)
-        scores = final["logits"].sigmoid() * presence.sigmoid()[:, None, :]
-        out.update(presence=presence, boxes=final["boxes"], logits=final["logits"], scores=scores,
+        scores = final["logits"].sigmoid()
+        if self.cfg.use_presence:
+            scores = scores * presence.sigmoid()[:, None, :]
+        out.update(presence=presence, boxes=final["boxes"], logits=final["logits"], scores=scores, fdr=final["fdr"],
                    uncertainty=final["uncertainty"], query=final["q"])
         if return_masks:
             out["masks"] = self.mask_head(p3, final["q"])
