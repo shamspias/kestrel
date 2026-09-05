@@ -150,3 +150,9 @@ __pycache__/
 # Others
 *.DS_Store
 *.swp
+data/
+runs/
+.venv/
+*.onnx
+*.pt
+*.pth
