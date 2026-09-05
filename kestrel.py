@@ -615,7 +615,7 @@ class RoICrossAttention(nn.Module):
         cx, cy = (boxes[..., 0] + boxes[..., 2]) / 2, (boxes[..., 1] + boxes[..., 3]) / 2
         w, h = (boxes[..., 2] - boxes[..., 0]) * self.ctx / 2, (boxes[..., 3] - boxes[..., 1]) * self.ctx / 2
         rois = torch.stack([cx - w, cy - h, cx + w, cy + h], -1).reshape(B * K, 4)
-        bidx = torch.arange(B, device=boxes.device, dtype=boxes.dtype).repeat_interleave(K)[:, None]
+        bidx = torch.arange(B, device=boxes.device, dtype=boxes.dtype)[:, None].expand(B, K).reshape(-1, 1)   # tracer-safe (no repeat_interleave on a traced int)
         rois = torch.cat([bidx, rois], 1)
         toks = [roi_align(f, rois, (self.g, self.g), spatial_scale=1.0 / s, sampling_ratio=2, aligned=True).flatten(2)
                 for f, s in zip(kv_maps, self.strides)]

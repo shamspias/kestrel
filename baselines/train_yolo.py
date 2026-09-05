@@ -1,6 +1,8 @@
 """Train ultralytics baselines (YOLO26 / YOLO11 / YOLOv8 / RT-DETR) on VOC07+12 under the same data, image size,
 epoch budget and device as KESTREL. Usage: python baselines/train_yolo.py yolo26n.yaml --epochs 60 --imgsz 512"""
-import argparse, os, sys
+import argparse
+import os, os, sys
+os.environ.setdefault("YOLO_AUTOINSTALL", "False")   # ultralytics must not pip-install (it once replaced torch)
 from ultralytics import YOLO, RTDETR
 
 ap = argparse.ArgumentParser()

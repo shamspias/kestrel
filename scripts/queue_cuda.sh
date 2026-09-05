@@ -3,7 +3,7 @@
 # Each stage is idempotent (skipped when its "training complete" / "epochs completed" marker exists) and retried
 # with --resume, so the script can be re-run after an interruption.
 # Usage: nohup bash scripts/queue_cuda.sh > runs/queue_cuda.log 2>&1 &
-set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate; export PYTHONUNBUFFERED=1
+set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate; export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # never let ultralytics pip-install into the venv
 log() { echo "[$(date '+%F %T')] $*"; }
 EP_MAIN=${EP_MAIN:-80}; EP_ABL=${EP_ABL:-30}; SZ_MAIN=${SZ_MAIN:-512}; SZ_ABL=${SZ_ABL:-416}; EP_BASE=${EP_BASE:-$EP_MAIN}
 BS_N=${BS_N:-16}; LR_N=${LR_N:-2e-3}; BS_S=${BS_S:-8}; LR_S=${LR_S:-1e-3}; BS_BASE=${BS_BASE:-32}; AMP=${AMP:-fp16}
