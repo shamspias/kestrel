@@ -42,12 +42,13 @@ if a.latency:
     dev = torch.device(a.device)
     net = model.model.to(dev).eval().float()
     x = torch.randn(1, 3, a.imgsz, a.imgsz, device=dev)
+    sync = (torch.mps.synchronize if dev.type == "mps" else torch.cuda.synchronize if dev.type == "cuda" else (lambda: None))
     with torch.no_grad():
         for _ in range(10): net(x)
-        if dev.type == "mps": torch.mps.synchronize()
+        sync()
         t = time.perf_counter()
         for _ in range(50): net(x)
-        if dev.type == "mps": torch.mps.synchronize()
+        sync()
     stats["latency_ms_raw"] = 1000 * (time.perf_counter() - t) / 50
     print("raw forward latency ms:", round(stats["latency_ms_raw"], 2))
 if a.out:

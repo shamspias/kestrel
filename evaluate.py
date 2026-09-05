@@ -204,6 +204,8 @@ if __name__ == "__main__":
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--update", action="store_true", help="merge into an existing --out JSON instead of overwriting it (e.g. add latency later on an idle GPU)")
+    ap.add_argument("--skip-full", action="store_true", help="with --update: keep the stored full-depth result instead of recomputing it")
     a = ap.parse_args()
     dev = torch.device(a.device)
     model, ck = load_checkpoint(a.ckpt, dev)
@@ -213,9 +215,11 @@ if __name__ == "__main__":
         model.reparameterize()
     if a.exit:
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = a.exit
-    out = dict(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit)
+    out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
+    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev))
     print(f"model {ck['args']['model']}  params {out['params_M']:.2f}M  epoch {ck.get('epoch')}")
-    out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
+    if not (a.skip_full and "full" in out):
+        out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
     print("full depth:", {k: round(v, 2) for k, v in out["full"].items()})
     if a.static_sweep:
         out["static"] = {}
