@@ -45,7 +45,7 @@ def load_checkpoint(path: str, device, ema: bool = True) -> Tuple[KESTREL, Dict]
     ck = torch.load(path, map_location="cpu", weights_only=False)
     args = ck["args"]
     model = build_model(args["model"], 20, local_attn=args.get("local_attn", "roi"), use_presence=not args.get("no_presence", False),
-                        fdr_scale=args.get("fdr_scale", 0.5), ls_init=args.get("ls_init", 1e-2))
+                        fdr_scale=args.get("fdr_scale", 0.5), ls_init=args.get("ls_init", 1e-2), presence_power=args.get("presence_power", 1.0))
     sd = ck["ema"] if (ema and "ema" in ck) else ck["model"]
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not [k for k in missing if not k.startswith(("mask_head", "kpt_head", "slots", "temporal"))], missing
@@ -133,8 +133,15 @@ def coco_eval(results: List[Dict], gt_path: str, quiet: bool = True) -> Dict[str
     return dict(AP=100 * s[0], AP50=100 * s[1], AP75=100 * s[2], APs=100 * s[3], APm=100 * s[4], APl=100 * s[5])
 
 
-def run_eval(model, loader, gt_path, id_map, recs, device, **kw) -> Dict:
-    res, info = predict(model, loader, device, id_map, recs, **kw)
+def run_eval(model, loader, gt_path, id_map, recs, device, gate_power: Optional[float] = None, **kw) -> Dict:
+    """gate_power overrides cfg.presence_power for this evaluation only (None = leave the model's setting)."""
+    saved = model.cfg.presence_power
+    if gate_power is not None:
+        model.cfg.presence_power = gate_power
+    try:
+        res, info = predict(model, loader, device, id_map, recs, **kw)
+    finally:
+        model.cfg.presence_power = saved
     stats = coco_eval(res, gt_path)
     stats.update({k: v for k, v in info.items() if k != "mean_exit_per_image"})
     return stats
@@ -203,6 +210,8 @@ if __name__ == "__main__":
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
+    ap.add_argument("--gate-sweep", action="store_true", help="also report full-depth AP for gate exponents 1, 0.5 and 0")
     ap.add_argument("--out", default=None)
     ap.add_argument("--update", action="store_true", help="merge into an existing --out JSON instead of overwriting it (e.g. add latency later on an idle GPU)")
     ap.add_argument("--skip-full", action="store_true", help="with --update: keep the stored full-depth result instead of recomputing it")
@@ -215,12 +224,20 @@ if __name__ == "__main__":
         model.reparameterize()
     if a.exit:
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = a.exit
+    if a.gate_power is not None:
+        model.cfg.presence_power = a.gate_power
     out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
-    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev))
+    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev),
+               gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0)
     print(f"model {ck['args']['model']}  params {out['params_M']:.2f}M  epoch {ck.get('epoch')}")
     if not (a.skip_full and "full" in out):
         out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
     print("full depth:", {k: round(v, 2) for k, v in out["full"].items()})
+    if a.gate_sweep and model.cfg.use_presence:
+        out["gate"] = {}
+        for g in (1.0, 0.5, 0.0):
+            out["gate"][str(g)] = run_eval(model, loader, gt_path, id_map, recs, dev, gate_power=g)
+            print(f"presence gate power {g}:", {k: round(v, 2) for k, v in out["gate"][str(g)].items() if k.startswith("AP")})
     if a.static_sweep:
         out["static"] = {}
         for l in range(1, L):

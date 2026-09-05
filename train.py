@@ -100,6 +100,7 @@ def main():
     ap.add_argument("--w-lsd", type=float, default=1.0)
     ap.add_argument("--fdr-scale", type=float, default=1.0, help="max edge offset as a fraction of the seed box side")
     ap.add_argument("--ls-init", type=float, default=1e-2, help="LayerScale init")
+    ap.add_argument("--presence-power", type=float, default=1.0, help="eval-time presence gate exponent (1 product, 0.5 geometric mean, 0 off)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed); random.seed(a.seed); np.random.seed(a.seed)
@@ -124,7 +125,8 @@ def main():
     print(f"train images {len(recs)}  test images {len(test_recs)}  iters/epoch {len(loader)}")
 
     # ---------------- model / loss / optim
-    model = build_model(a.model, 20, local_attn=a.local_attn, use_presence=not a.no_presence, fdr_scale=a.fdr_scale, ls_init=a.ls_init).to(dev)
+    model = build_model(a.model, 20, local_attn=a.local_attn, use_presence=not a.no_presence, fdr_scale=a.fdr_scale, ls_init=a.ls_init,
+                        presence_power=a.presence_power).to(dev)
     if a.init:
         sd = torch.load(a.init, map_location="cpu")
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -206,6 +208,8 @@ def main():
             t0 = time.time()
             stats = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev)
             stats["AP_dense"] = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev, dense_nms=True)["AP"]
+            if not a.no_presence and a.presence_power > 0:
+                stats["AP_nogate"] = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev, gate_power=0.0)["AP"]
             print(f"EVAL epoch {epoch}: " + " ".join(f"{k}={v:.2f}" for k, v in stats.items()) + f"  ({(time.time() - t0) / 60:.1f} min)", flush=True)
             logf.write(json.dumps(dict(epoch=epoch, eval=stats)) + "\n"); logf.flush()
             if stats["AP"] > best:

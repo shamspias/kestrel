@@ -86,6 +86,7 @@ class KestrelConfig:
     local_attn: str = "roi"                      # "roi" (RoI-gathered, export-native) | "deform" (multi-scale deformable)
     deform_points: int = 4
     use_presence: bool = True                    # gate query scores with the presence head
+    presence_power: float = 1.0                  # score = sigmoid(z) * sigmoid(pi)^power; 1 = SAM-3 product, 0.5 = geometric mean, 0 = no gate
     detach_seeds: bool = True                    # detach seed boxes/content before the decoder (train stability)
     ls_init: float = 1e-2                        # LayerScale init for conv/attention residual branches
 
@@ -953,8 +954,9 @@ class KESTREL(nn.Module):
 
         presence = self.presence(self.vocab.embeddings, self.decoder.mem_proj(mem))       # (B, C)
         scores = final["logits"].sigmoid()
-        if self.cfg.use_presence:
-            scores = scores * presence.sigmoid()[:, None, :]
+        if self.cfg.use_presence and self.cfg.presence_power > 0:
+            gate = presence.sigmoid()[:, None, :]
+            scores = scores * (gate if self.cfg.presence_power == 1.0 else gate.pow(self.cfg.presence_power))
         out.update(presence=presence, boxes=final["boxes"], logits=final["logits"], scores=scores, fdr=final["fdr"],
                    uncertainty=final["uncertainty"], query=final["q"])
         if return_masks:
