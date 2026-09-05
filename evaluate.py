@@ -29,6 +29,13 @@ PRESETS = {
 }
 
 
+def sync(device) -> None:
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def build_model(name: str, num_classes: int = 20, **over) -> KESTREL:
     kw = dict(PRESETS[name]); kw.update(over)
     return KESTREL(replace(KestrelConfig(), num_classes=num_classes, **kw))
@@ -64,10 +71,10 @@ def predict(model: KESTREL, loader, device, id_map: Dict, recs: List[Dict], max_
     results, exits, n_img, t_fwd = [], [], 0, 0.0
     for imgs, _, _, metas in loader:
         x = normalize(imgs.to(device))
-        if device.type == "mps": torch.mps.synchronize()
+        sync(device)
         t0 = time.perf_counter()
         out = model(x, return_masks=False, max_layers=max_layers, anytime=anytime, num_queries=num_queries)
-        if device.type == "mps": torch.mps.synchronize()
+        sync(device)
         t_fwd += time.perf_counter() - t0
         if dense_nms:
             from torchvision.ops import batched_nms
@@ -139,11 +146,11 @@ def latency(model: KESTREL, device, size: int, n: int = 50, warm: int = 10, **kw
     x = torch.randn(1, 3, size, size, device=device)
     for _ in range(warm):
         model(x, return_masks=False, **kw)
-    if device.type == "mps": torch.mps.synchronize()
+    sync(device)
     t0 = time.perf_counter()
     for _ in range(n):
         model(x, return_masks=False, **kw)
-    if device.type == "mps": torch.mps.synchronize()
+    sync(device)
     return 1000 * (time.perf_counter() - t0) / n
 
 
@@ -155,10 +162,10 @@ def latency_anytime(model: KESTREL, loader, device, n_images: int = 200, warm: i
     for imgs, _, _, _ in loader:
         for i in range(imgs.shape[0]):
             x = normalize(imgs[i:i + 1].to(device))
-            if device.type == "mps": torch.mps.synchronize()
+            sync(device)
             t0 = time.perf_counter()
             out = model(x, return_masks=False, anytime=True)
-            if device.type == "mps": torch.mps.synchronize()
+            sync(device)
             dt = time.perf_counter() - t0
             k += 1
             if k > warm:
@@ -174,9 +181,9 @@ def latency_fixed_images(model: KESTREL, loader, device, n_images: int = 200, wa
     for imgs, _, _, _ in loader:
         for i in range(imgs.shape[0]):
             x = normalize(imgs[i:i + 1].to(device))
-            if device.type == "mps": torch.mps.synchronize()
+            sync(device)
             t0 = time.perf_counter(); model(x, return_masks=False, max_layers=max_layers)
-            if device.type == "mps": torch.mps.synchronize()
+            sync(device)
             k += 1
             if k > warm: times.append(1000 * (time.perf_counter() - t0))
             if k >= n_images + warm: return dict(ms_mean=float(np.mean(times)), ms_median=float(np.median(times)), n=len(times))
@@ -217,6 +224,7 @@ if __name__ == "__main__":
             print(f"static L={l}:", {k: round(v, 2) for k, v in out["static"][l].items()})
     if a.anytime_sweep:
         out["anytime"] = []
+        saved_exit = (model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg)
         grid = [(p, u, bg) for p in (0.5, 0.6, 0.7, 0.8) for u in (0.10, 0.15, 0.20, 0.30) for bg in (0.02, 0.05, 0.10)]
         for p, u, bg in grid:
             model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
@@ -224,6 +232,7 @@ if __name__ == "__main__":
             r.update(exit_p=p, exit_u=u, exit_bg=bg)
             out["anytime"].append(r)
             print(f"anytime p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+        model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = saved_exit      # restore --exit thresholds for --anytime / --latency-anytime
     if a.anytime:
         out["anytime_single"] = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
         print("anytime:", {k: (round(v, 2) if isinstance(v, float) else v) for k, v in out["anytime_single"].items()})

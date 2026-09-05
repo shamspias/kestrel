@@ -148,6 +148,7 @@ def main():
         start_epoch, it, best, ema.updates = ck["epoch"] + 1, ck["iter"], ck.get("best", -1.0), ck.get("ema_updates", 0)
         print(f"resumed from epoch {ck['epoch']} (iter {it}, best {best:.2f})")
     amp_dtype = dict(none=None, bf16=torch.bfloat16, fp16=torch.float16)[a.amp]
+    scaler = torch.amp.GradScaler(dev.type, enabled=amp_dtype == torch.float16)   # fp16 needs loss scaling; bf16/fp32 do not
     K, heads = model.cfg.num_queries, model.cfg.dec_heads
     logf = open(f"{a.out}/log.jsonl", "a")
     json.dump(vars(a), open(f"{a.out}/args.json", "w"), indent=1)
@@ -179,9 +180,10 @@ def main():
             if not torch.isfinite(loss):
                 print("non-finite loss, skipping step", log); opt.zero_grad(set_to_none=True); it += 1; continue
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
-            opt.step()
+            scaler.step(opt); scaler.update()
             ema.update(model)
             it += 1; seen += imgs.shape[0]
             for k, v in log.items():
@@ -209,6 +211,7 @@ def main():
             if stats["AP"] > best:
                 best = stats["AP"]; ck["best"] = best
                 torch.save(ck, f"{a.out}/best.pt")
+                torch.save(ck, f"{a.out}/last.pt")            # keep last.pt's `best` current so a resume cannot overwrite best.pt with a worse model
     print(f"training complete. best AP {best:.2f}")
 
 
