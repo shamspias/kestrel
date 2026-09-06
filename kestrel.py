@@ -82,6 +82,8 @@ class KestrelConfig:
     exit_bg: float = 0.05                        # confident background
     exit_u: float = 0.15                         # normalised localisation entropy
     exit_min_layers: int = 2
+    exit_mode: str = "remove"                    # "remove": exited queries leave later layers entirely; "freeze": they stay as
+                                                 # self-attention keys/values (frozen at their exit state) but are not recomputed
     # ablation / training switches
     local_attn: str = "roi"                      # "roi" (RoI-gathered, export-native) | "deform" (multi-scale deformable)
     deform_points: int = 4
@@ -696,9 +698,15 @@ class DecoderLayer(nn.Module):
         nn.init.zeros_(self.delta_fdr.weight); nn.init.zeros_(self.delta_fdr.bias)
         self.region = nn.Linear(d, cfg.embed_dim)
 
-    def forward(self, q, qpos, boxes, kv_maps, mem, mem_pos, sa_mask=None):
+    def forward(self, q, qpos, boxes, kv_maps, mem, mem_pos, sa_mask=None, sa_kv=None):
+        """sa_kv=(q_all, qpos_all): self-attention keys/values over a larger query set than the ones being updated
+        (anytime 'freeze' mode: exited queries remain visible to the active ones without being recomputed)."""
         x = self.n1(q) + qpos
-        q = q + self.sa(x, x, self.n1(q), attn_mask=sa_mask, need_weights=False)[0]
+        if sa_kv is None:
+            q = q + self.sa(x, x, self.n1(q), attn_mask=sa_mask, need_weights=False)[0]
+        else:
+            nk = self.n1(sa_kv[0])
+            q = q + self.sa(x, nk + sa_kv[1], nk, attn_mask=sa_mask, need_weights=False)[0]
         q = q + self.roi_xa(self.n2(q), boxes.detach(), kv_maps)
         q = q + self.glob_xa(self.n3(q) + qpos, mem + mem_pos, mem, need_weights=False)[0]
         q = q + self.ffn(self.n4(q))
@@ -757,7 +765,8 @@ class AnytimeDecoder(nn.Module):
                 ia = active.nonzero().squeeze(1)
                 if ia.numel() == 0:
                     break
-                qa = layer(qb[:, ia], self.qpos(boxes_b[:, ia], img_hw), boxes_b[:, ia], fb, mb, mpb)
+                sa_kv = (qb, self.qpos(boxes_b, img_hw)) if (cfg.exit_mode == "freeze" and ia.numel() < K) else None
+                qa = layer(qb[:, ia], self.qpos(boxes_b[:, ia], img_hw), boxes_b[:, ia], fb, mb, mpb, sa_kv=sa_kv)
                 fdr_a = fdr_b[:, ia] + layer.delta_fdr(qa).view(1, -1, 4, cfg.fdr_bins)
                 qb[:, ia], fdr_b[:, ia] = qa, fdr_a
                 boxes_b[:, ia] = self.fdr.decode(fdr_a, boxb0[:, ia])

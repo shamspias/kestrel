@@ -213,6 +213,7 @@ if __name__ == "__main__":
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--exit-mode", default=None, choices=["remove", "freeze"], help="anytime exit: remove exited queries from later layers (default) or keep them frozen as self-attention keys")
     ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
     ap.add_argument("--gate-sweep", action="store_true", help="also report full-depth AP for gate exponents 1, 0.5 and 0")
     ap.add_argument("--out", default=None)
@@ -229,9 +230,11 @@ if __name__ == "__main__":
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = a.exit
     if a.gate_power is not None:
         model.cfg.presence_power = a.gate_power
+    if a.exit_mode:
+        model.cfg.exit_mode = a.exit_mode
     out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
     out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev),
-               gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0)
+               gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0, exit_mode=model.cfg.exit_mode)
     print(f"model {ck['args']['model']}  params {out['params_M']:.2f}M  epoch {ck.get('epoch')}")
     if not (a.skip_full and "full" in out):
         out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
