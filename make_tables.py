@@ -102,12 +102,22 @@ def full_stats(j, gate):
 
 
 def last_eval(run):
-    """Last EVAL line of a training log (log.jsonl) — used for the recipe A/B table."""
+    """Last EVAL record of a training log, plus whether that run actually finished.
+
+    A run still in progress has EVAL lines too, and printing its latest one in a results table would present
+    an intermediate epoch as a final number. Callers must check `done`."""
     p = f"{run}/log.jsonl"
     if not os.path.exists(p):
         return None
     ev = [json.loads(l) for l in open(p) if '"eval"' in l]
-    return ev[-1] if ev else None
+    if not ev:
+        return None
+    r = dict(ev[-1])
+    log = f"{run}.log"
+    r["done"] = os.path.exists(log) and "training complete" in open(log, errors="ignore").read()
+    args = load(f"{run}/args.json")
+    r["target_epochs"] = args.get("epochs") if args else None
+    return r
 
 
 def anytime_points(run, full_only=True, bg_only=True, keep_policies=False):
@@ -324,16 +334,18 @@ with open(P / "tables/ablation.tex", "w") as fh:
 
 # ------------------------------------------------------------------ recipe A/B table
 with open(P / "tables/recipe.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Recipe check} (\\kestrel{}-N, 10 epochs at $416^2$, batch 16, one change per row; VOC07 test AP of the EMA weights after the last epoch, gate off).}\\label{tab:recipe}\n")
-    fh.write("\\begin{tabular}{lrr}\\toprule\nRecipe & AP & AP$_{50}$ \\\\\\midrule\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Choosing the training recipe.} \\kestrel{}-N, 10 epochs at $416^2$, batch 16, one change per row, VOC07 test AP of the EMA weights. These are short-horizon comparisons used to \\emph{select} the 80-epoch recipe, not results about the recipe at 80 epochs: a 10-epoch cosine schedule reaches its low-rate phase within two epochs and therefore favours a lower peak rate than a long schedule would.}\\label{tab:recipe}\n")
+    fh.write("\\begin{tabular}{lrrr}\\toprule\nRecipe & Epochs & AP (gate off) & AP (gated) \\\\\\midrule\n")
     for label, d in RECIPE_AB:
         e = last_eval(d)
-        if e:
-            ev = e["eval"]; ap = ev.get("AP_nogate", ev["AP"])
-            fh.write(f"{label} & {f(ap)} & {f(ev['AP50']) if 'AP_nogate' not in ev else '--'} \\\\\n")
-        else:
-            fh.write(f"{label} & -- & -- \\\\\n")
+        if not e:
+            fh.write(f"{label} & -- & -- & -- \\\\\n"); continue
+        ev = e["eval"]
+        ep = f"{e['epoch'] + 1}" + ("" if e["done"] else f"/{e['target_epochs']}*")
+        fh.write(f"{label} & {ep} & {f(ev.get('AP_nogate'))} & {f(ev.get('AP'))} \\\\\n")
     fh.write("\\bottomrule\\end{tabular}\\end{table}\n")
+    if any((last_eval(d) or {}).get("done") is False for _, d in RECIPE_AB):
+        print("  note: recipe table contains a run still in progress (marked * in the epoch column)")
 
 # ------------------------------------------------------------------ latency table
 with open(P / "tables/latency.tex", "w") as fh:
