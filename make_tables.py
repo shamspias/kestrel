@@ -95,18 +95,43 @@ def last_eval(run):
     return ev[-1] if ev else None
 
 
-def anytime_points(run):
+def anytime_points(run, full_only=True, bg_only=True):
     """Every anytime measurement for a run, merged across eval.json and the extra sweep files, tagged with exit mode
-    and minimum depth (older files predate those fields: they used removal with a two-layer minimum)."""
+    and minimum depth (older files predate those fields: they used removal with a two-layer minimum).
+
+    Files produced with --subset score a different image set, so their AP is NOT comparable with the full-set
+    rows and mixing the two in one table is a reporting error. They are skipped unless full_only=False, and
+    the number skipped is printed so the omission is never silent. Points that fix a key set as a control
+    (keys_kept >= 0) or use the random-exit control policy are also excluded from the main table: they belong
+    to their own analyses, not to the accuracy-versus-depth comparison."""
     import glob
-    pts, seen = [], set()
+    rows = []
     for path in sorted(glob.glob(f"{run}/eval*.json")):
         jj = load(path)
         for r in (jj or {}).get("anytime", []) or []:
-            r = dict(r); r.setdefault("mode", jj.get("exit_mode", "remove")); r.setdefault("min_layers", 2)
-            key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"])
-            if key not in seen:
-                seen.add(key); pts.append(r)
+            if r.get("keys_kept", -1) not in (-1, None) or r.get("policy", "confidence") != "confidence":
+                continue                                       # control experiments belong to their own analyses
+            if bg_only and (r.get("exit_p") is not None and r["exit_p"] <= 1.0):
+                continue                                       # the reported curve disables the foreground rule
+                                                               # (tau_p > 1); mixing in entropy-rule points would
+                                                               # put two different policies on one axis
+            r = dict(r); r.setdefault("mode", (jj or {}).get("exit_mode", "remove")); r.setdefault("min_layers", 2)
+            rows.append(r)
+    # Every row records the number of images it was scored on. Rows from a --subset run are not comparable with
+    # full-set rows, and mixing them in one table is a reporting error, so keep only the largest image count.
+    counts = {r.get("images") for r in rows if r.get("images")}
+    keep = max(counts) if (full_only and counts) else None
+    pts, seen, skipped = [], set(), 0
+    for r in rows:
+        if keep and r.get("images") and r["images"] != keep:
+            skipped += 1
+            continue
+        key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"])
+        if key not in seen:
+            seen.add(key); pts.append(r)
+    if skipped:
+        print(f"  note: {run}: dropped {skipped} anytime points scored on fewer than {keep} images "
+              f"(not comparable with the full-set rows)")
     return pts
 
 
@@ -189,7 +214,7 @@ j_g, j_n = load(f"{MAIN}/eval.json"), load(f"{MAIN}/eval_nogate.json")
 j = j_n or j_g                                                     # headline anytime numbers: ungated if available
 t_n = load(f"{MAIN}/trt.json")
 with open(P / "tables/anytime.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth.}\\label{tab:anytime}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth.}\\label{tab:anytime}\n")
     fh.write("\\begin{tabular}{llrrrrr}\\toprule\nMode & Setting & Depth & AP & AP$_{50}$ & torch ms & TRT ms \\\\\\midrule\n")
     if j:
         L = len(j.get("static", {})) + 1
