@@ -82,10 +82,28 @@ class KestrelConfig:
     exit_bg: float = 0.05                        # confident background
     exit_u: float = 0.15                         # normalised localisation entropy
     exit_min_layers: int = 2
+    anytime_batched: bool = False                # True: score the anytime policy with the fast masked batched pass
+                                                 # (identical outputs, no compute saving); False: the real sequential path
+    exit_policy: str = "confidence"               # "confidence": the rule of eq. (exit); "random": exit each query with
+                                                 # probability `exit_random_p` (a control that matches depth but ignores
+                                                 # which query is which); "none": never exit
+    exit_random_p: float = 0.5
+    key_dropout: float = 0.0                     # TRAINING: per layer, hide a random fraction (sampled in [0, key_dropout])
+                                                 # of queries from the decoder's self-attention keys, so the decoder sees a
+                                                 # varying peer-set size. Removing exited queries at inference is otherwise a
+                                                 # distribution shift the classification head was never trained for.
+    exit_keys_kept: int = -1                      # analysis control for "remove" mode: how many randomly chosen exited
+                                                 # queries stay visible as self-attention keys. <= 0 keeps none (plain
+                                                 # removal); a positive value keeps that many; keeping all is exactly
+                                                 # exit_mode="freeze". Sweeping it separates "how many keys vanish"
+                                                 # from "which ones vanish".
+    exit_mode: str = "remove"                    # "remove": exited queries leave later layers entirely; "freeze": they stay as
+                                                 # self-attention keys/values (frozen at their exit state) but are not recomputed
     # ablation / training switches
     local_attn: str = "roi"                      # "roi" (RoI-gathered, export-native) | "deform" (multi-scale deformable)
     deform_points: int = 4
     use_presence: bool = True                    # gate query scores with the presence head
+    presence_power: float = 1.0                  # score = sigmoid(z) * sigmoid(pi)^power; 1 = SAM-3 product, 0.5 = geometric mean, 0 = no gate
     detach_seeds: bool = True                    # detach seed boxes/content before the decoder (train stability)
     ls_init: float = 1e-2                        # LayerScale init for conv/attention residual branches
 
@@ -615,7 +633,7 @@ class RoICrossAttention(nn.Module):
         cx, cy = (boxes[..., 0] + boxes[..., 2]) / 2, (boxes[..., 1] + boxes[..., 3]) / 2
         w, h = (boxes[..., 2] - boxes[..., 0]) * self.ctx / 2, (boxes[..., 3] - boxes[..., 1]) * self.ctx / 2
         rois = torch.stack([cx - w, cy - h, cx + w, cy + h], -1).reshape(B * K, 4)
-        bidx = torch.arange(B, device=boxes.device, dtype=boxes.dtype).repeat_interleave(K)[:, None]
+        bidx = torch.arange(B, device=boxes.device, dtype=boxes.dtype)[:, None].expand(B, K).reshape(-1, 1)   # tracer-safe (no repeat_interleave on a traced int)
         rois = torch.cat([bidx, rois], 1)
         toks = [roi_align(f, rois, (self.g, self.g), spatial_scale=1.0 / s, sampling_ratio=2, aligned=True).flatten(2)
                 for f, s in zip(kv_maps, self.strides)]
@@ -695,9 +713,15 @@ class DecoderLayer(nn.Module):
         nn.init.zeros_(self.delta_fdr.weight); nn.init.zeros_(self.delta_fdr.bias)
         self.region = nn.Linear(d, cfg.embed_dim)
 
-    def forward(self, q, qpos, boxes, kv_maps, mem, mem_pos, sa_mask=None):
+    def forward(self, q, qpos, boxes, kv_maps, mem, mem_pos, sa_mask=None, sa_kv=None):
+        """sa_kv=(q_all, qpos_all): self-attention keys/values over a larger query set than the ones being updated
+        (anytime 'freeze' mode: exited queries remain visible to the active ones without being recomputed)."""
         x = self.n1(q) + qpos
-        q = q + self.sa(x, x, self.n1(q), attn_mask=sa_mask, need_weights=False)[0]
+        if sa_kv is None:
+            q = q + self.sa(x, x, self.n1(q), attn_mask=sa_mask, need_weights=False)[0]
+        else:
+            nk = self.n1(sa_kv[0])
+            q = q + self.sa(x, nk + sa_kv[1], nk, attn_mask=sa_mask, need_weights=False)[0]
         q = q + self.roi_xa(self.n2(q), boxes.detach(), kv_maps)
         q = q + self.glob_xa(self.n3(q) + qpos, mem + mem_pos, mem, need_weights=False)[0]
         q = q + self.ffn(self.n4(q))
@@ -719,6 +743,30 @@ class AnytimeDecoder(nn.Module):
     def qpos(self, boxes, img_hw):
         return self.pos_mlp(sine_embed(boxes_to_norm_cxcywh(boxes.detach(), img_hw)))
 
+    def key_dropout_mask(self, sa_mask, B: int, K: int, device):
+        """Training-time regularisation for anytime inference: hide a random subset of queries from this layer's
+        self-attention KEYS (they are still updated as queries). The drop fraction is resampled per layer and per image
+        from [0, cfg.key_dropout], so the decoder is trained across the whole range of peer-set sizes that per-query
+        exit produces at inference. Every query always keeps itself as a key, so no attention row is fully masked."""
+        p = self.cfg.key_dropout
+        if not self.training or p <= 0:
+            return sa_mask
+        frac = torch.rand(B, 1, device=device) * p
+        drop = torch.rand(B, K, device=device) < frac                       # (B, K) keys hidden this layer
+        m = drop[:, None, :].expand(B, K, K).clone()
+        i = torch.arange(K, device=device)
+        m[:, i, i] = False                                                  # a query can always attend to itself
+        h = self.cfg.dec_heads
+        m = m[:, None].expand(B, h, K, K).reshape(B * h, K, K)
+        if sa_mask is None:
+            return m
+        if sa_mask.shape[-1] != K:                                          # denoising queries are appended: pad to the full set
+            S = sa_mask.shape[-1]
+            full = sa_mask.new_zeros(B * h, S, S)
+            full[:, :K, :K] = m
+            return sa_mask | full
+        return sa_mask | m
+
     def kv_maps(self, feats):
         return [p(f) for p, f in zip(self.kv_proj, feats)]
 
@@ -729,13 +777,61 @@ class AnytimeDecoder(nn.Module):
         fdr_logits = q.new_zeros(B, K, 4, self.cfg.fdr_bins)
         boxes, outs = box_init, []
         for layer in self.layers[: max_layers or len(self.layers)]:
-            q = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, sa_mask)
+            q = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, self.key_dropout_mask(sa_mask, B, K, q.device))
             fdr_logits = fdr_logits + layer.delta_fdr(q).view(B, K, 4, -1)
             boxes = self.fdr.decode(fdr_logits, box_init)
             region = layer.region(q)
             outs.append(dict(q=q, boxes=boxes, fdr=fdr_logits, region=region, logits=self.vocab(region),
                              uncertainty=self.fdr.entropy(fdr_logits)))
         return outs
+
+    @torch.no_grad()
+    def forward_anytime_batched(self, q, box_init, feats, mem, mem_pos, img_hw) -> Dict[str, torch.Tensor]:
+        """Batched equivalent of `forward_anytime`, for ACCURACY evaluation only.
+
+        Every query is evaluated at every layer and the updates of already-exited queries are discarded, which
+        reproduces the sequential per-query exit exactly: an exited query's state is frozen either way, and in
+        "remove" mode the exited queries are additionally masked out as self-attention keys, which is what the
+        sequential path achieves by not passing them to the layer at all. It saves no compute -- use the
+        sequential path to measure latency -- but it is far faster to score a whole test set with."""
+        cfg, B, K, d = self.cfg, *q.shape
+        mem, kv = self.mem_proj(mem), self.kv_maps(feats)
+        fdr = q.new_zeros(B, K, 4, cfg.fdr_bins)
+        boxes, region = box_init.clone(), q.new_zeros(B, K, cfg.embed_dim)
+        exit_layer = torch.full((B, K), len(self.layers), dtype=torch.long, device=q.device)
+        active = torch.ones(B, K, dtype=torch.bool, device=q.device)
+        eye = torch.eye(K, dtype=torch.bool, device=q.device)
+        for li, layer in enumerate(self.layers):
+            if not active.any():
+                break
+            sa_mask = None
+            if cfg.exit_mode == "remove" and not active.all():
+                hidden = ~active                                   # exited queries are hidden as keys ...
+                if cfg.exit_keys_kept > 0:                         # ... except a random subset kept visible (control)
+                    r = torch.rand(B, K, device=q.device).masked_fill(active, -1.0)
+                    keep = r.argsort(dim=1, descending=True)[:, : cfg.exit_keys_kept]
+                    hidden = hidden.scatter(1, keep, False)
+                # keep the diagonal so a fully exited image cannot produce NaN
+                dead = hidden[:, None, :].expand(B, K, K) & ~eye[None]
+                sa_mask = dead[:, None].expand(B, cfg.dec_heads, K, K).reshape(B * cfg.dec_heads, K, K)
+            qn = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, sa_mask)
+            fdr_n = fdr + layer.delta_fdr(qn).view(B, K, 4, cfg.fdr_bins)
+            a1, a2 = active[..., None], active[..., None, None]
+            q = torch.where(a1, qn, q)
+            fdr = torch.where(a2, fdr_n, fdr)
+            boxes = torch.where(a1, self.fdr.decode(fdr, box_init), boxes)
+            region = torch.where(a1, layer.region(qn), region)
+            if li + 1 >= cfg.exit_min_layers and cfg.exit_policy != "none":
+                if cfg.exit_policy == "random":
+                    done = active & (torch.rand(B, K, device=q.device) < cfg.exit_random_p)
+                else:
+                    p = self.vocab(region).sigmoid().amax(-1)
+                    u = self.fdr.entropy(fdr)
+                    done = active & (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
+                exit_layer = torch.where(done, torch.full_like(exit_layer, li + 1), exit_layer)
+                active = active & ~done
+        return dict(q=q, boxes=boxes, fdr=fdr, region=region, logits=self.vocab(region),
+                    uncertainty=self.fdr.entropy(fdr), exit_layer=exit_layer)
 
     @torch.no_grad()
     def forward_anytime(self, q, box_init, feats, mem, mem_pos, img_hw) -> Dict[str, torch.Tensor]:
@@ -756,15 +852,17 @@ class AnytimeDecoder(nn.Module):
                 ia = active.nonzero().squeeze(1)
                 if ia.numel() == 0:
                     break
-                qa = layer(qb[:, ia], self.qpos(boxes_b[:, ia], img_hw), boxes_b[:, ia], fb, mb, mpb)
+                sa_kv = (qb, self.qpos(boxes_b, img_hw)) if (cfg.exit_mode == "freeze" and ia.numel() < K) else None
+                qa = layer(qb[:, ia], self.qpos(boxes_b[:, ia], img_hw), boxes_b[:, ia], fb, mb, mpb, sa_kv=sa_kv)
                 fdr_a = fdr_b[:, ia] + layer.delta_fdr(qa).view(1, -1, 4, cfg.fdr_bins)
                 qb[:, ia], fdr_b[:, ia] = qa, fdr_a
                 boxes_b[:, ia] = self.fdr.decode(fdr_a, boxb0[:, ia])
                 region_b[:, ia] = layer.region(qa)
                 p = self.vocab(region_b[:, ia]).sigmoid().amax(-1)[0]
                 u = self.fdr.entropy(fdr_a)[0]
-                if li + 1 >= cfg.exit_min_layers:
-                    done = ((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg)
+                if li + 1 >= cfg.exit_min_layers and cfg.exit_policy != "none":
+                    done = (torch.rand(ia.numel(), device=q.device) < cfg.exit_random_p) if cfg.exit_policy == "random" \
+                        else (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
                     exit_layer[ia[done]] = li + 1
                     active[ia[done]] = False
             results.append(dict(q=qb, boxes=boxes_b, fdr=fdr_b, region=region_b, logits=self.vocab(region_b),
@@ -940,7 +1038,8 @@ class KESTREL(nn.Module):
                                             dense_anchors=dense["anchors"], dense_strides=dense["strides"], query_idx=idx,
                                             init_logits=init_logits, box_init=box_init[:, :K])
         if anytime and not self.training and state is None:
-            final = self.decoder.forward_anytime(q, box_init, feats, mem, mem_pos, (H, W))
+            fn = self.decoder.forward_anytime_batched if self.cfg.anytime_batched else self.decoder.forward_anytime
+            final = fn(q, box_init, feats, mem, mem_pos, (H, W))
             out["exit_layer"] = final["exit_layer"]
         else:
             layers = self.decoder(q, box_init, feats, mem, mem_pos, (H, W), sa_mask, max_layers)
@@ -953,8 +1052,9 @@ class KESTREL(nn.Module):
 
         presence = self.presence(self.vocab.embeddings, self.decoder.mem_proj(mem))       # (B, C)
         scores = final["logits"].sigmoid()
-        if self.cfg.use_presence:
-            scores = scores * presence.sigmoid()[:, None, :]
+        if self.cfg.use_presence and self.cfg.presence_power > 0:
+            gate = presence.sigmoid()[:, None, :]
+            scores = scores * (gate if self.cfg.presence_power == 1.0 else gate.pow(self.cfg.presence_power))
         out.update(presence=presence, boxes=final["boxes"], logits=final["logits"], scores=scores, fdr=final["fdr"],
                    uncertainty=final["uncertainty"], query=final["q"])
         if return_masks:

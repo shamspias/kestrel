@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import io
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
@@ -44,8 +46,9 @@ def build_model(name: str, num_classes: int = 20, **over) -> KESTREL:
 def load_checkpoint(path: str, device, ema: bool = True) -> Tuple[KESTREL, Dict]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     args = ck["args"]
+    over = {k: args[k] for k in ("dec_layers", "key_dropout") if args.get(k)}          # structural overrides recorded at training time
     model = build_model(args["model"], 20, local_attn=args.get("local_attn", "roi"), use_presence=not args.get("no_presence", False),
-                        fdr_scale=args.get("fdr_scale", 0.5), ls_init=args.get("ls_init", 1e-2))
+                        fdr_scale=args.get("fdr_scale", 0.5), ls_init=args.get("ls_init", 1e-2), presence_power=args.get("presence_power", 1.0), **over)
     sd = ck["ema"] if (ema and "ema" in ck) else ck["model"]
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not [k for k in missing if not k.startswith(("mask_head", "kpt_head", "slots", "temporal"))], missing
@@ -133,8 +136,15 @@ def coco_eval(results: List[Dict], gt_path: str, quiet: bool = True) -> Dict[str
     return dict(AP=100 * s[0], AP50=100 * s[1], AP75=100 * s[2], APs=100 * s[3], APm=100 * s[4], APl=100 * s[5])
 
 
-def run_eval(model, loader, gt_path, id_map, recs, device, **kw) -> Dict:
-    res, info = predict(model, loader, device, id_map, recs, **kw)
+def run_eval(model, loader, gt_path, id_map, recs, device, gate_power: Optional[float] = None, **kw) -> Dict:
+    """gate_power overrides cfg.presence_power for this evaluation only (None = leave the model's setting)."""
+    saved = model.cfg.presence_power
+    if gate_power is not None:
+        model.cfg.presence_power = gate_power
+    try:
+        res, info = predict(model, loader, device, id_map, recs, **kw)
+    finally:
+        model.cfg.presence_power = saved
     stats = coco_eval(res, gt_path)
     stats.update({k: v for k, v in info.items() if k != "mean_exit_per_image"})
     return stats
@@ -156,8 +166,10 @@ def latency(model: KESTREL, device, size: int, n: int = 50, warm: int = 10, **kw
 
 @torch.no_grad()
 def latency_anytime(model: KESTREL, loader, device, n_images: int = 200, warm: int = 10):
-    """Batch-1 wall-clock of the anytime forward on real test images (the exit pattern depends on content)."""
+    """Batch-1 wall-clock of the anytime forward on real test images (the exit pattern depends on content).
+    Always times the sequential per-query implementation: the batched one is an accuracy-only equivalent."""
     model.eval()
+    saved_impl, model.cfg.anytime_batched = model.cfg.anytime_batched, False
     times, depths, k = [], [], 0
     for imgs, _, _, _ in loader:
         for i in range(imgs.shape[0]):
@@ -171,7 +183,9 @@ def latency_anytime(model: KESTREL, loader, device, n_images: int = 200, warm: i
             if k > warm:
                 times.append(1000 * dt); depths.append(out["exit_layer"].float().mean().item())
             if k >= n_images + warm:
+                model.cfg.anytime_batched = saved_impl
                 return dict(ms_mean=float(np.mean(times)), ms_median=float(np.median(times)), mean_depth=float(np.mean(depths)), n=len(times))
+    model.cfg.anytime_batched = saved_impl
     return dict(ms_mean=float(np.mean(times)), ms_median=float(np.median(times)), mean_depth=float(np.mean(depths)), n=len(times))
 
 
@@ -191,32 +205,67 @@ def latency_fixed_images(model: KESTREL, loader, device, n_images: int = 200, wa
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)          # a redirected sweep log must show progress live
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--subset", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=2, help="test dataloader workers (keep low: workers fork the parent, and several jobs share this host)")
     ap.add_argument("--static-sweep", action="store_true", help="AP for max_layers = 1..L")
     ap.add_argument("--anytime-sweep", action="store_true", help="AP vs mean depth over exit thresholds")
+    ap.add_argument("--sweep-p", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8], help="foreground-exit thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-u", type=float, nargs="+", default=[0.10, 0.15, 0.20, 0.30], help="entropy thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-bg", type=float, nargs="+", default=[0.02, 0.05, 0.10], help="background-exit thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-min-layers", type=int, nargs="+", default=None, help="minimum layers before a query may exit (default: the model's setting)")
+    ap.add_argument("--sweep-mode", nargs="+", default=None, choices=["remove", "freeze"], help="exit modes to sweep (default: the model's setting)")
     ap.add_argument("--latency", action="store_true")
     ap.add_argument("--latency-anytime", action="store_true", help="batch-1 anytime latency on real images at the current cfg thresholds")
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--sweep-keys-kept", type=int, nargs="+", default=None,
+                    help="remove-mode control: number of exited queries still visible as self-attention keys (-1 = all = freeze, 0 = none)")
+    ap.add_argument("--sweep-policy", nargs="+", default=None, choices=["confidence", "random"],
+                    help="exit policies to sweep; 'random' is the depth-matched control that ignores which query is which")
+    ap.add_argument("--sweep-random-p", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9],
+                    help="per-layer exit probability for the random control")
+    ap.add_argument("--anytime-seq", action="store_true", help="score anytime with the sequential per-query pass (default: the equivalent batched pass, which is much faster)")
+    ap.add_argument("--exit-min-layers", type=int, default=None, help="minimum layers before a query may exit, for --anytime / --latency-anytime (the reported operating points use 1)")
+    ap.add_argument("--exit-mode", default=None, choices=["remove", "freeze"], help="anytime exit: remove exited queries from later layers (default) or keep them frozen as self-attention keys")
+    ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
+    ap.add_argument("--gate-sweep", action="store_true", help="also report full-depth AP for gate exponents 1, 0.5 and 0")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--update", action="store_true", help="merge into an existing --out JSON instead of overwriting it (e.g. add latency later on an idle GPU)")
+    ap.add_argument("--skip-full", action="store_true", help="with --update: keep the stored full-depth result instead of recomputing it")
     a = ap.parse_args()
     dev = torch.device(a.device)
     model, ck = load_checkpoint(a.ckpt, dev)
-    loader, gt_path, id_map, recs = build_test(a.size, subset=a.subset)
+    loader, gt_path, id_map, recs = build_test(a.size, subset=a.subset, workers=a.workers)
     L = model.cfg.dec_layers
     if a.reparam:
         model.reparameterize()
     if a.exit:
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = a.exit
-    out = dict(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit)
+    if a.gate_power is not None:
+        model.cfg.presence_power = a.gate_power
+    if a.exit_mode:
+        model.cfg.exit_mode = a.exit_mode
+    if a.exit_min_layers:
+        model.cfg.exit_min_layers = a.exit_min_layers
+    model.cfg.anytime_batched = not a.anytime_seq
+    out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
+    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, subset=a.subset, device=str(dev),
+               gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0, exit_mode=model.cfg.exit_mode)
     print(f"model {ck['args']['model']}  params {out['params_M']:.2f}M  epoch {ck.get('epoch')}")
-    out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
+    if not (a.skip_full and "full" in out):
+        out["full"] = run_eval(model, loader, gt_path, id_map, recs, dev)
     print("full depth:", {k: round(v, 2) for k, v in out["full"].items()})
+    if a.gate_sweep and model.cfg.use_presence:
+        out["gate"] = {}
+        for g in (1.0, 0.5, 0.0):
+            out["gate"][str(g)] = run_eval(model, loader, gt_path, id_map, recs, dev, gate_power=g)
+            print(f"presence gate power {g}:", {k: round(v, 2) for k, v in out["gate"][str(g)].items() if k.startswith("AP")})
     if a.static_sweep:
         out["static"] = {}
         for l in range(1, L):
@@ -225,13 +274,35 @@ if __name__ == "__main__":
     if a.anytime_sweep:
         out["anytime"] = []
         saved_exit = (model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg)
-        grid = [(p, u, bg) for p in (0.5, 0.6, 0.7, 0.8) for u in (0.10, 0.15, 0.20, 0.30) for bg in (0.02, 0.05, 0.10)]
-        for p, u, bg in grid:
-            model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
+        saved_ml, saved_mode = model.cfg.exit_min_layers, model.cfg.exit_mode
+        saved_pol = model.cfg.exit_policy
+        grid = []
+        for md in (a.sweep_mode or [saved_mode]):
+            for ml in (a.sweep_min_layers or [saved_ml]):
+                for pol in (a.sweep_policy or ["confidence"]):
+                    if pol == "random":
+                        grid += [(md, ml, pol, None, None, None, rp) for rp in a.sweep_random_p]
+                    else:
+                        grid += [(md, ml, pol, p, u, bg, None)
+                                 for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
+        saved_keys = model.cfg.exit_keys_kept
+        grid = [(md, ml, pol, p, u, bg, rp, kk) for (md, ml, pol, p, u, bg, rp) in grid
+                for kk in (a.sweep_keys_kept or [saved_keys])]
+        for md, ml, pol, p, u, bg, rp, kk in grid:
+            model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = ml, md, pol
+            model.cfg.exit_keys_kept = kk
+            if pol == "random":
+                model.cfg.exit_random_p = rp
+            else:
+                model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
-            r.update(exit_p=p, exit_u=u, exit_bg=bg)
+            gc.collect()                                     # each config builds ~1.5M detection dicts; release before the next one
+            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md, policy=pol, random_p=rp, keys_kept=kk)
             out["anytime"].append(r)
-            print(f"anytime p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+            tag = (f"random p={rp}" if pol == "random" else f"p={p} u={u} bg={bg}") + (f" keys={kk}" if kk != -1 else "")
+            print(f"anytime mode={md} min_l={ml} {tag}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+        model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = saved_ml, saved_mode, saved_pol
+        model.cfg.exit_keys_kept = saved_keys
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = saved_exit      # restore --exit thresholds for --anytime / --latency-anytime
     if a.anytime:
         out["anytime_single"] = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
@@ -242,6 +313,8 @@ if __name__ == "__main__":
         print("latency ms (batch 1, random):", out["latency_ms"]); print("latency ms (batch 1, images):", out["latency_ms_images"])
     if a.latency_anytime:
         out["latency_anytime"] = latency_anytime(model, loader, dev)
+        out["latency_anytime"].update(mode=model.cfg.exit_mode, min_layers=model.cfg.exit_min_layers, policy=model.cfg.exit_policy,
+                                      exit_p=model.cfg.exit_p, exit_u=model.cfg.exit_u, exit_bg=model.cfg.exit_bg)
         print("anytime latency:", out["latency_anytime"])
     if a.out:
         json.dump(out, open(a.out, "w"), indent=1)

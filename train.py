@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -100,8 +101,19 @@ def main():
     ap.add_argument("--w-lsd", type=float, default=1.0)
     ap.add_argument("--fdr-scale", type=float, default=1.0, help="max edge offset as a fraction of the seed box side")
     ap.add_argument("--ls-init", type=float, default=1e-2, help="LayerScale init")
+    ap.add_argument("--presence-power", type=float, default=1.0, help="eval-time presence gate exponent (1 product, 0.5 geometric mean, 0 off)")
+    ap.add_argument("--key-dropout", type=float, default=0.0, help="training-time self-attention key dropout in the decoder (0 = off); trains the decoder for the varying peer-set sizes that per-query exit produces")
+    ap.add_argument("--dec-layers", type=int, default=None, help="override the preset's decoder depth (the anytime mechanism has more headroom the deeper the decoder is)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    # Exclusive lock on the output directory: several experiment queues may be driving this repo at once, and two
+    # processes writing the same last.pt/best.pt would corrupt both. A duplicate start exits quietly instead.
+    _lock = open(os.path.join(a.out, ".train.lock"), "w")
+    try:
+        fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another process is already training {a.out} (lock held); exiting"); return
+    _lock.write(f"{os.getpid()}\n"); _lock.flush()
     torch.manual_seed(a.seed); random.seed(a.seed); np.random.seed(a.seed)
     dev = torch.device(a.device)
 
@@ -124,7 +136,11 @@ def main():
     print(f"train images {len(recs)}  test images {len(test_recs)}  iters/epoch {len(loader)}")
 
     # ---------------- model / loss / optim
-    model = build_model(a.model, 20, local_attn=a.local_attn, use_presence=not a.no_presence, fdr_scale=a.fdr_scale, ls_init=a.ls_init).to(dev)
+    over = dict(dec_layers=a.dec_layers) if a.dec_layers else {}
+    if a.key_dropout:
+        over["key_dropout"] = a.key_dropout
+    model = build_model(a.model, 20, local_attn=a.local_attn, use_presence=not a.no_presence, fdr_scale=a.fdr_scale, ls_init=a.ls_init,
+                        presence_power=a.presence_power, **over).to(dev)
     if a.init:
         sd = torch.load(a.init, map_location="cpu")
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -206,6 +222,8 @@ def main():
             t0 = time.time()
             stats = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev)
             stats["AP_dense"] = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev, dense_nms=True)["AP"]
+            if not a.no_presence and a.presence_power > 0:
+                stats["AP_nogate"] = run_eval(ema.ema, test_loader, gt_path, id_map, test_recs, dev, gate_power=0.0)["AP"]
             print(f"EVAL epoch {epoch}: " + " ".join(f"{k}={v:.2f}" for k, v in stats.items()) + f"  ({(time.time() - t0) / 60:.1f} min)", flush=True)
             logf.write(json.dumps(dict(epoch=epoch, eval=stats)) + "\n"); logf.flush()
             if stats["AP"] > best:
