@@ -224,6 +224,8 @@ if __name__ == "__main__":
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--sweep-keys-kept", type=int, nargs="+", default=None,
+                    help="remove-mode control: number of exited queries still visible as self-attention keys (-1 = all = freeze, 0 = none)")
     ap.add_argument("--sweep-policy", nargs="+", default=None, choices=["confidence", "random"],
                     help="exit policies to sweep; 'random' is the depth-matched control that ignores which query is which")
     ap.add_argument("--sweep-random-p", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9],
@@ -280,19 +282,24 @@ if __name__ == "__main__":
                     else:
                         grid += [(md, ml, pol, p, u, bg, None)
                                  for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
-        for md, ml, pol, p, u, bg, rp in grid:
+        saved_keys = model.cfg.exit_keys_kept
+        grid = [(md, ml, pol, p, u, bg, rp, kk) for (md, ml, pol, p, u, bg, rp) in grid
+                for kk in (a.sweep_keys_kept or [saved_keys])]
+        for md, ml, pol, p, u, bg, rp, kk in grid:
             model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = ml, md, pol
+            model.cfg.exit_keys_kept = kk
             if pol == "random":
                 model.cfg.exit_random_p = rp
             else:
                 model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
             gc.collect()                                     # each config builds ~1.5M detection dicts; release before the next one
-            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md, policy=pol, random_p=rp)
+            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md, policy=pol, random_p=rp, keys_kept=kk)
             out["anytime"].append(r)
-            tag = f"random p={rp}" if pol == "random" else f"p={p} u={u} bg={bg}"
+            tag = (f"random p={rp}" if pol == "random" else f"p={p} u={u} bg={bg}") + (f" keys={kk}" if kk != -1 else "")
             print(f"anytime mode={md} min_l={ml} {tag}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
         model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = saved_ml, saved_mode, saved_pol
+        model.cfg.exit_keys_kept = saved_keys
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = saved_exit      # restore --exit thresholds for --anytime / --latency-anytime
     if a.anytime:
         out["anytime_single"] = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)

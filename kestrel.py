@@ -88,6 +88,11 @@ class KestrelConfig:
                                                  # probability `exit_random_p` (a control that matches depth but ignores
                                                  # which query is which); "none": never exit
     exit_random_p: float = 0.5
+    exit_keys_kept: int = -1                      # analysis control for "remove" mode: how many randomly chosen exited
+                                                 # queries stay visible as self-attention keys. <= 0 keeps none (plain
+                                                 # removal); a positive value keeps that many; keeping all is exactly
+                                                 # exit_mode="freeze". Sweeping it separates "how many keys vanish"
+                                                 # from "which ones vanish".
     exit_mode: str = "remove"                    # "remove": exited queries leave later layers entirely; "freeze": they stay as
                                                  # self-attention keys/values (frozen at their exit state) but are not recomputed
     # ablation / training switches
@@ -773,8 +778,13 @@ class AnytimeDecoder(nn.Module):
                 break
             sa_mask = None
             if cfg.exit_mode == "remove" and not active.all():
-                # hide exited queries as keys, but keep the diagonal so a fully exited image cannot produce NaN
-                dead = (~active)[:, None, :].expand(B, K, K) & ~eye[None]
+                hidden = ~active                                   # exited queries are hidden as keys ...
+                if cfg.exit_keys_kept > 0:                         # ... except a random subset kept visible (control)
+                    r = torch.rand(B, K, device=q.device).masked_fill(active, -1.0)
+                    keep = r.argsort(dim=1, descending=True)[:, : cfg.exit_keys_kept]
+                    hidden = hidden.scatter(1, keep, False)
+                # keep the diagonal so a fully exited image cannot produce NaN
+                dead = hidden[:, None, :].expand(B, K, K) & ~eye[None]
                 sa_mask = dead[:, None].expand(B, cfg.dec_heads, K, K).reshape(B * cfg.dec_heads, K, K)
             qn = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, sa_mask)
             fdr_n = fdr + layer.delta_fdr(qn).view(B, K, 4, cfg.fdr_bins)
