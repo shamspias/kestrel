@@ -12,7 +12,7 @@
 set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate
 export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date '+%F %T')] $*"; }
-EP_BASE=${EP_BASE:-80}; SZ=${SZ:-512}; BS=${BS:-32}; BS_BIG=${BS_BIG:-16}; WK=${WK:-4}
+EP_BASE=${EP_BASE:-80}; SZ=${SZ:-512}; BS=${BS:-32}; BS_BIG=${BS_BIG:-16}; WK=${WK:-2}   # worker forks, not model size, are what exhausts host RAM on this box; the loader has never been the bottleneck
 mkdir -p runs/baselines
 
 b() { name=$1; cfg=$2; bs=${3:-$BS}; wk=${4:-$WK}; extra=${5:-}
@@ -32,8 +32,7 @@ b() { name=$1; cfg=$2; bs=${3:-$BS}; wk=${4:-$WK}; extra=${5:-}
     python baselines/eval_yolo.py "$w" --imgsz $SZ --device 0 --end2end false \
       --out runs/baselines/${name}_nms.json > runs/baselines/${name}_nms.eval.log 2>&1;; esac; }
 
-# 0. let the nano run already in flight finish rather than restarting it mid-schedule
-while pgrep -f "train_yolo.py yolo26n.yaml" > /dev/null; do sleep 60; done; log "yolo26n_scratch finished or idle"
+# b() already skips a completed run, so no external guard is needed (a pgrep guard here also self-matched).
 b yolo26n_scratch   yolo26n.yaml
 # 1. the unproven row, settled first
 b rtdetrl_scratch   rtdetr-l.yaml    $BS_BIG 2

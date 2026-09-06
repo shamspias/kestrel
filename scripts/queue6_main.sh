@@ -11,7 +11,7 @@
 set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate
 export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date '+%F %T')] $*"; }
-EP_MAIN=${EP_MAIN:-80}; EP_ABL=${EP_ABL:-30}; SZ_MAIN=${SZ_MAIN:-512}; SZ_ABL=${SZ_ABL:-416}; EP_AB=${EP_AB:-10}; WK=${WK:-5}
+EP_MAIN=${EP_MAIN:-80}; EP_ABL=${EP_ABL:-30}; SZ_MAIN=${SZ_MAIN:-512}; SZ_ABL=${SZ_ABL:-416}; EP_AB=${EP_AB:-10}; WK=${WK:-3}   # host RAM, not throughput: KESTREL is bounded by its single-threaded main process, not by data loading
 
 # Sweeps. The foreground/entropy rule is inert (tau_p 1.1, tau_H 0 disable it), so only the background rule is swept.
 # Headline run: both exit modes, both minimum depths, four thresholds — 16 anytime configurations.
