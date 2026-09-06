@@ -252,7 +252,7 @@ if __name__ == "__main__":
         model.cfg.exit_mode = a.exit_mode
     model.cfg.anytime_batched = not a.anytime_seq
     out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
-    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev),
+    out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, subset=a.subset, device=str(dev),
                gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0, exit_mode=model.cfg.exit_mode)
     print(f"model {ck['args']['model']}  params {out['params_M']:.2f}M  epoch {ck.get('epoch')}")
     if not (a.skip_full and "full" in out):
