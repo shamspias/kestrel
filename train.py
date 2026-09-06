@@ -175,6 +175,7 @@ def main():
             ds.mosaic = 0.0; loader = make_loader(); print("mosaic closed")
         model.train()
         t_ep, t_last, seen, agg = time.time(), time.time(), 0, {}
+        n_skipped = 0
         for imgs, boxes, labels, _ in loader:
             for g in opt.param_groups:
                 g["lr"] = lr_at(it)
@@ -199,7 +200,13 @@ def main():
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), a.clip)
+            # A GradScaler skips the optimiser step when gradients overflow, and signals it by lowering the scale.
+            # Counting those tells us whether fp16 instability (rather than precision itself) explains a recipe result;
+            # without it, "the scaler was skipping steps" is an untestable story. Free: two reads of a float.
+            _scale_before = scaler.get_scale() if scaler.is_enabled() else 0.0
             scaler.step(opt); scaler.update()
+            if scaler.is_enabled() and scaler.get_scale() < _scale_before:
+                n_skipped += 1
             ema.update(model)
             it += 1; seen += imgs.shape[0]
             for k, v in log.items():
@@ -212,8 +219,10 @@ def main():
                 eta = (total_iters - it) * a.bs / ips / 3600
                 keys = ["total", "d_cls", "d_box", "d_qual", "cls", "l1", "giou", "fdr", "dn_cls", "dn_giou", "lsd", "pres", "n_fg"]
                 s = " ".join(f"{k}={avg[k]:.3f}" for k in keys if k in avg)
-                print(f"ep {epoch} it {it} lr {lr_at(it):.2e} gn {float(gn):.2f} {ips:.1f} img/s eta {eta:.1f}h | {s}", flush=True)
-                logf.write(json.dumps(dict(epoch=epoch, iter=it, lr=lr_at(it), ips=ips, **avg)) + "\n"); logf.flush()
+                sk = f" skip {n_skipped} scale {scaler.get_scale():.0f}" if scaler.is_enabled() else ""
+                print(f"ep {epoch} it {it} lr {lr_at(it):.2e} gn {float(gn):.2f} {ips:.1f} img/s eta {eta:.1f}h{sk} | {s}", flush=True)
+                logf.write(json.dumps(dict(epoch=epoch, iter=it, lr=lr_at(it), ips=ips, skipped=n_skipped,
+                                           scale=scaler.get_scale() if scaler.is_enabled() else None, **avg)) + "\n"); logf.flush()
         print(f"epoch {epoch} done in {(time.time() - t_ep) / 60:.1f} min", flush=True)
         ck = dict(model=model.state_dict(), ema=ema.ema.state_dict(), opt=opt.state_dict(), epoch=epoch, iter=it, best=best,
                   ema_updates=ema.updates, args=vars(a))
