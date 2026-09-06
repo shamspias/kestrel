@@ -16,6 +16,12 @@ until /usr/bin/grep -q "training complete" runs/abl_nodn.log 2>/dev/null; do sle
 until /usr/bin/grep -q "lane C done" runs/queue5_deep.log 2>/dev/null; do sleep 120; done; log "lane C finished"
 until [ -f runs/RECIPE_N ]; do sleep 30; done; source runs/RECIPE_N
 SWEEP="--static-sweep --anytime-sweep --sweep-mode remove freeze --sweep-min-layers 1 2 --sweep-policy confidence random --sweep-p 1.1 --sweep-u 0.0 --sweep-bg 0.05 0.1 0.2 0.3 --sweep-random-p 0.3 0.6 0.9 --anytime --exit $EXIT"
+# keys-kept curve: how many exited queries must stay visible as attention keys. A model trained with key dropout should
+# be flat from zero keys; the no-dropout control rises steeply. Same axes, one figure, the cleanest test of the fix.
+KEYSWEEP="--anytime-sweep --sweep-mode remove --sweep-min-layers 1 --sweep-p 1.1 --sweep-u 0.0 --sweep-bg 0.2 --sweep-keys-kept 0 5 10 20 40 80"
+keys() { run=$1; [ -f runs/$run/best.pt ] || return; [ -f runs/$run/eval_keys.json ] && return
+  log "keys-kept sweep $run"
+  python evaluate.py --ckpt runs/$run/best.pt --size $SZ_ABL --device cuda --reparam --workers 1 --gate-power 0     $KEYSWEEP --out runs/$run/eval_keys.json > runs/$run/eval_keys.log 2>&1; }
 kd() { name=$1; p=$2
   for try in 1 2 3; do /usr/bin/grep -q "training complete" runs/$name.log 2>/dev/null && break
     log "run $name (try $try): key dropout $p"
@@ -27,6 +33,7 @@ kd() { name=$1; p=$2
   python evaluate.py --ckpt runs/$name/best.pt --size $SZ_ABL --device cuda --reparam --workers 1 --gate-sweep --static-sweep --out runs/$name/eval.json > runs/$name/eval.log 2>&1
   python scripts/duplicate_analysis.py --ckpt runs/$name/best.pt --size $SZ_ABL --subset 600 --gate-power 0 \
     --configs full freeze:1:0.2 remove:1:0.2 freeze:2:0.05 remove:2:0.05 --out runs/$name/dupes.json > runs/$name/dupes.log 2>&1; }
-kd abl_keydrop 0.9
-kd abl_keydrop_mild 0.5
+keys abl_full                 # the no-dropout control, trained by lane A on the same schedule
+kd abl_keydrop 0.9;      keys abl_keydrop
+kd abl_keydrop_mild 0.5; keys abl_keydrop_mild
 log "lane F done"
