@@ -11,7 +11,9 @@ set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate
 export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date '+%F %T')] $*"; }
 EP_ABL=${EP_ABL:-30}; SZ_ABL=${SZ_ABL:-416}; EXIT=${EXIT:-0.6 0.15 0.05}
+# wait for the ablations AND for lane C, so at most one extra training job shares the GPU with lane A's KESTREL-S
 until /usr/bin/grep -q "training complete" runs/abl_nodn.log 2>/dev/null; do sleep 120; done; log "ablations finished"
+until /usr/bin/grep -q "lane C done" runs/queue5_deep.log 2>/dev/null; do sleep 120; done; log "lane C finished"
 until [ -f runs/RECIPE_N ]; do sleep 30; done; source runs/RECIPE_N
 SWEEP="--static-sweep --anytime-sweep --sweep-mode remove freeze --sweep-min-layers 1 2 --sweep-policy confidence random --sweep-p 1.1 --sweep-u 0.0 --sweep-bg 0.05 0.1 0.2 0.3 --sweep-random-p 0.3 0.6 0.9 --anytime --exit $EXIT"
 kd() { name=$1; p=$2
