@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
@@ -202,6 +203,7 @@ def latency_fixed_images(model: KESTREL, loader, device, n_images: int = 200, wa
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)          # a redirected sweep log must show progress live
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--size", type=int, default=512)
