@@ -129,6 +129,9 @@ family KESTREL itself belongs to. Run it with `bash scripts/queue_baselines_full
 | small (7.3–11.2 M) | YOLO26s, YOLO11s, YOLOv10s, YOLOv9s, YOLOv8s | KESTREL-S (13.0 M) | queued |
 | reference | YOLO26n, YOLO26s, COCO-pretrained | context only, **not** like-for-like | queued |
 
+The full suite is roughly 173 GPU-hours on one RTX 2080 Ti. It is ordered so that stopping at any point still
+leaves a coherent table, and `make_tables.py` fills rows as runs land.
+
 Both the end-to-end and the NMS decoding paths are scored for YOLO26 and YOLOv10.
 
 ---
