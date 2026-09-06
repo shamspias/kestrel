@@ -3,15 +3,15 @@
 # still leaves a coherent result set. Replaces queue5_kestrel.sh, queue5_deep.sh and queue5_keydrop.sh, which between
 # them ordered the constructive fix and the deep-decoder variant AFTER six ablations and would not have reached them.
 #
-# Why the budget changed: measured throughput under two-lane contention is about 10.6 min per epoch at 416 px and
-# 13.6 at 512, so the original plan (six ablations at 30 epochs, plus 12-config sweeps after each) came to roughly
-# 90 GPU-hours for lane A alone. Ablations are now 15 epochs, and the per-run sweeps are cut to what the tables
-# actually print. The comparison stays valid because every ablation row, including the reference, uses this schedule.
+# Budget: measured throughput under two-lane contention is about 10.6 min per epoch at 416 px and 13.6 at 512, so this
+# lane is roughly 100 GPU-hours: kestrel_n2 19.5, eight 30-epoch ablations 42.4, KESTREL-S 35.5. Ablations run the full
+# 30 epochs; what was cut instead is the per-run evaluation sweep, which had been 12 configurations at ~10 min each and
+# so cost as much as the training it followed. Sweeps now cover exactly what the tables print.
 # Usage: nohup bash scripts/queue6_main.sh > runs/queue6_main.log 2>&1 &
 set -u; cd "$(dirname "$0")/.."; source .venv/bin/activate
 export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date '+%F %T')] $*"; }
-EP_MAIN=${EP_MAIN:-80}; EP_ABL=${EP_ABL:-15}; SZ_MAIN=${SZ_MAIN:-512}; SZ_ABL=${SZ_ABL:-416}; EP_AB=${EP_AB:-10}; WK=${WK:-5}
+EP_MAIN=${EP_MAIN:-80}; EP_ABL=${EP_ABL:-30}; SZ_MAIN=${SZ_MAIN:-512}; SZ_ABL=${SZ_ABL:-416}; EP_AB=${EP_AB:-10}; WK=${WK:-5}
 
 # Sweeps. The foreground/entropy rule is inert (tau_p 1.1, tau_H 0 disable it), so only the background rule is swept.
 # Headline run: both exit modes, both minimum depths, four thresholds — 16 anytime configurations.
@@ -30,7 +30,7 @@ ev() { run=$1; sz=$2; shift 2; [ -f runs/$run/best.pt ] || return; [ -f runs/$ru
        python analysis.py --ckpt runs/$run/best.pt --size $sz --device cuda --out runs/$run/calib.npz > runs/$run/calib.log 2>&1) & }
 
 # 0. the last recipe arm, then the recipe itself
-while pgrep -f "train.py .*runs/ab_lr" > /dev/null; do sleep 30; done
+while pgrep -f "train.py .*runs/ab_" > /dev/null; do sleep 30; done      # an arm may already be running under an earlier shell
 AMP_N=none k ab_fp32_lr1e3 --model N --bs 16 --size $SZ_ABL --epochs $EP_AB --eval-every 5 --lr 1e-3 --init runs/distill_n/backbone.pt
 log "recipe arms done — waiting for runs/RECIPE_N"
 until [ -f runs/RECIPE_N ]; do sleep 30; done; source runs/RECIPE_N
