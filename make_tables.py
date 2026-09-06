@@ -116,17 +116,23 @@ def anytime_points(run, full_only=True, bg_only=True):
                                                                # (tau_p > 1); mixing in entropy-rule points would
                                                                # put two different policies on one axis
             r = dict(r); r.setdefault("mode", (jj or {}).get("exit_mode", "remove")); r.setdefault("min_layers", 2)
+            r["gate_power"] = (jj or {}).get("gate_power", 1.0)   # gated and ungated rows are NOT comparable
             rows.append(r)
     # Every row records the number of images it was scored on. Rows from a --subset run are not comparable with
     # full-set rows, and mixing them in one table is a reporting error, so keep only the largest image count.
     counts = {r.get("images") for r in rows if r.get("images")}
     keep = max(counts) if (full_only and counts) else None
+    gates = {r["gate_power"] for r in rows}
+    keep_gate = min(gates) if len(gates) > 1 else None          # prefer ungated once an ungated sweep exists
     pts, seen, skipped = [], set(), 0
     for r in rows:
         if keep and r.get("images") and r["images"] != keep:
             skipped += 1
             continue
-        key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"])
+        if keep_gate is not None and r["gate_power"] != keep_gate:
+            skipped += 1
+            continue
+        key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"], r["gate_power"])
         if key not in seen:
             seen.add(key); pts.append(r)
     if skipped:
@@ -178,7 +184,11 @@ with open(P / "tables/main.tex", "w") as fh:
         fh.write(f"{r[0]} & {f(r[1], 2)} & {f(r[2])} & {f(r[3])} & {f(r[4])} & {f(r[5])} & {f(r[6])} & {f(r[7])} & {f(r[8], 2)} & {f(r[9], 2)} \\\\\n")
     fh.write("\\bottomrule\\end{tabular}\\end{table}\n")
 
-with open(P / "tables/published.tex", "w") as fh:
+# The published-COCO table is deliberately NOT generated: those are author-reported numbers on different data,
+# hardware and schedules, none of them measured here, and a table of them next to ours invites exactly the
+# comparison the setup section forbids. The list is kept above for reference only.
+if False:
+  with open(P / "tables/published.tex", "w") as fh:
     fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Published COCO val2017 results} of nano/small real-time detectors, as reported by their authors (T4, TensorRT FP16, batch 1). Listed for context only: different data, schedule and hardware from our VOC study, so not comparable to Table~\\ref{tab:main}.}\\label{tab:published}\n")
     fh.write("\\begin{tabular}{lrrr}\\toprule\nModel & COCO AP & T4 ms & Params (M) \\\\\\midrule\n")
     for name, apv, ms, pm in PUBLISHED_COCO:
@@ -217,7 +227,7 @@ _gp = (j or {}).get("gate_power")
 gate_note = (" (gate off, $\\gamma{=}0$)" if (j_n or _gp == 0.0)
              else (f" (presence gate on, $\\gamma{{=}}{_gp:g}$)" if _gp is not None else ""))
 with open(P / "tables/anytime.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + gate_note + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth. Every row is scored on the same \\detcount{} test images.}\\label{tab:anytime}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + gate_note + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Rows are the Pareto frontier of the threshold sweep, so dominated settings are omitted. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth. Every row is scored on the same \\detcount{} test images.}\\label{tab:anytime}\n")
     fh.write("\\begin{tabular}{llrrrrr}\\toprule\nMode & Setting & Depth & AP & AP$_{50}$ & torch ms & TRT ms \\\\\\midrule\n")
     if j:
         L = len(j.get("static", {})) + 1
@@ -278,7 +288,7 @@ except Exception as e:
 
 # ------------------------------------------------------------------ ablation table
 with open(P / "tables/ablation.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Ablations} (\\kestrel{}-N, \\epochsAbl{} epochs at $416^2$, VOC07 test, one change per row). AP is reported with the product gate ($\\gamma{=}1$) and with the gate off ($\\gamma{=}0$). Anytime AP and depth use the exit thresholds $\\tau_p{=}0.6,\\tau_H{=}0.15,\\tau_{bg}{=}0.05$ for every row.}\\label{tab:ablation}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Ablations} (\\kestrel{}-N, \\epochsAbl{} epochs at $416^2$, VOC07 test, one change per row). AP is reported with the product gate ($\\gamma{=}1$) and with the gate off ($\\gamma{=}0$). Anytime AP and depth use the confident-background rule alone ($\\tau_p>1$), at the same threshold for every row.}\\label{tab:ablation}\n")
     fh.write("\\begin{tabular}{lrrrrrr}\\toprule\nVariant & AP ($\\gamma{=}1$) & AP ($\\gamma{=}0$) & AP$_{50}$ ($\\gamma{=}0$) & AP$_{75}$ ($\\gamma{=}0$) & AP anytime & depth \\\\\\midrule\n")
     for label, d in ABLATIONS:
         jj = load(f"{d}/eval.json")
