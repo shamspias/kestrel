@@ -214,7 +214,7 @@ j_g, j_n = load(f"{MAIN}/eval.json"), load(f"{MAIN}/eval_nogate.json")
 j = j_n or j_g                                                     # headline anytime numbers: ungated if available
 t_n = load(f"{MAIN}/trt.json")
 with open(P / "tables/anytime.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth.}\\label{tab:anytime}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth. Every row is scored on the same \\detcount{} test images.}\\label{tab:anytime}\n")
     fh.write("\\begin{tabular}{llrrrrr}\\toprule\nMode & Setting & Depth & AP & AP$_{50}$ & torch ms & TRT ms \\\\\\midrule\n")
     if j:
         L = len(j.get("static", {})) + 1
@@ -222,6 +222,9 @@ with open(P / "tables/anytime.tex", "w") as fh:
             r = j["full"] if l == L else j["static"][str(l)]
             fh.write(f"static & $\\ell={l}$ & {l:.2f} & {f(r['AP'])} & {f(r['AP50'])} & {f(torch_ms(j_g, l), 2)} & {f(trt_ms(t_n, l), 2)} \\\\\n")
         allpts = anytime_points(MAIN)
+        n_img = {r.get("images") for r in allpts if r.get("images")}
+        if len(n_img) > 1:                                     # must never happen: one table, one image set
+            raise SystemExit(f"anytime table would mix image counts {sorted(n_img)} -- refusing to write it")
         for mode, tag in (("remove", "anytime, removal"), ("freeze", "anytime, frozen context")):
             sel = [r for r in allpts if r.get("mode") == mode]
             if not sel:
@@ -333,6 +336,7 @@ args = load("runs/kestrel_n/args.json"); macros["epochsMain"] = str(args["epochs
 aargs = load("runs/abl_full/args.json"); macros["epochsAbl"] = str(aargs["epochs"]) if aargs else "--"
 macros.setdefault("paramsN", "5.4"); macros.setdefault("gflopsN", "7.1"); macros.setdefault("paramsS", "13.0"); macros.setdefault("gflopsS", "17.3")
 macros["hardware"] = HW
+macros["detcount"] = str(sorted({r.get("images") for r in anytime_points(MAIN) if r.get("images")})[0]) if anytime_points(MAIN) else "4952"
 for k in ("mainResultText", "anytimeResultText", "calibResultText", "ablationResultText", "latencyResultText",
           "abstractResultText", "conclusionResultText", "gateResultText", "recipeResultText", "costResultText",
           "staticLossText", "decShareText", "mechanismResultText", "reproText", "KeydropResultText"):
