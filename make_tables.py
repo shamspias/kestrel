@@ -213,8 +213,11 @@ MAIN = "runs/kestrel_n2" if os.path.exists("runs/kestrel_n2/eval.json") else "ru
 j_g, j_n = load(f"{MAIN}/eval.json"), load(f"{MAIN}/eval_nogate.json")
 j = j_n or j_g                                                     # headline anytime numbers: ungated if available
 t_n = load(f"{MAIN}/trt.json")
+_gp = (j or {}).get("gate_power")
+gate_note = (" (gate off, $\\gamma{=}0$)" if (j_n or _gp == 0.0)
+             else (f" (presence gate on, $\\gamma{{=}}{_gp:g}$)" if _gp is not None else ""))
 with open(P / "tables/anytime.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth. Every row is scored on the same \\detcount{} test images.}\\label{tab:anytime}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + gate_note + ". Static: every query runs $\\ell$ layers. All anytime rows use the confident-background rule alone ($\\tau_p>1$ disables the foreground rule), which \\cref{sec:results:calib} shows is the only branch that does any work. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth. Every row is scored on the same \\detcount{} test images.}\\label{tab:anytime}\n")
     fh.write("\\begin{tabular}{llrrrrr}\\toprule\nMode & Setting & Depth & AP & AP$_{50}$ & torch ms & TRT ms \\\\\\midrule\n")
     if j:
         L = len(j.get("static", {})) + 1
