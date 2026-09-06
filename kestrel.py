@@ -84,6 +84,10 @@ class KestrelConfig:
     exit_min_layers: int = 2
     anytime_batched: bool = False                # True: score the anytime policy with the fast masked batched pass
                                                  # (identical outputs, no compute saving); False: the real sequential path
+    exit_policy: str = "confidence"               # "confidence": the rule of eq. (exit); "random": exit each query with
+                                                 # probability `exit_random_p` (a control that matches depth but ignores
+                                                 # which query is which); "none": never exit
+    exit_random_p: float = 0.5
     exit_mode: str = "remove"                    # "remove": exited queries leave later layers entirely; "freeze": they stay as
                                                  # self-attention keys/values (frozen at their exit state) but are not recomputed
     # ablation / training switches
@@ -779,10 +783,13 @@ class AnytimeDecoder(nn.Module):
             fdr = torch.where(a2, fdr_n, fdr)
             boxes = torch.where(a1, self.fdr.decode(fdr, box_init), boxes)
             region = torch.where(a1, layer.region(qn), region)
-            if li + 1 >= cfg.exit_min_layers:
-                p = self.vocab(region).sigmoid().amax(-1)
-                u = self.fdr.entropy(fdr)
-                done = active & (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
+            if li + 1 >= cfg.exit_min_layers and cfg.exit_policy != "none":
+                if cfg.exit_policy == "random":
+                    done = active & (torch.rand(B, K, device=q.device) < cfg.exit_random_p)
+                else:
+                    p = self.vocab(region).sigmoid().amax(-1)
+                    u = self.fdr.entropy(fdr)
+                    done = active & (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
                 exit_layer = torch.where(done, torch.full_like(exit_layer, li + 1), exit_layer)
                 active = active & ~done
         return dict(q=q, boxes=boxes, fdr=fdr, region=region, logits=self.vocab(region),
@@ -815,8 +822,9 @@ class AnytimeDecoder(nn.Module):
                 region_b[:, ia] = layer.region(qa)
                 p = self.vocab(region_b[:, ia]).sigmoid().amax(-1)[0]
                 u = self.fdr.entropy(fdr_a)[0]
-                if li + 1 >= cfg.exit_min_layers:
-                    done = ((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg)
+                if li + 1 >= cfg.exit_min_layers and cfg.exit_policy != "none":
+                    done = (torch.rand(ia.numel(), device=q.device) < cfg.exit_random_p) if cfg.exit_policy == "random" \
+                        else (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
                     exit_layer[ia[done]] = li + 1
                     active[ia[done]] = False
             results.append(dict(q=qb, boxes=boxes_b, fdr=fdr_b, region=region_b, logits=self.vocab(region_b),

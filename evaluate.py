@@ -223,6 +223,10 @@ if __name__ == "__main__":
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--sweep-policy", nargs="+", default=None, choices=["confidence", "random"],
+                    help="exit policies to sweep; 'random' is the depth-matched control that ignores which query is which")
+    ap.add_argument("--sweep-random-p", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9],
+                    help="per-layer exit probability for the random control")
     ap.add_argument("--anytime-seq", action="store_true", help="score anytime with the sequential per-query pass (default: the equivalent batched pass, which is much faster)")
     ap.add_argument("--exit-mode", default=None, choices=["remove", "freeze"], help="anytime exit: remove exited queries from later layers (default) or keep them frozen as self-attention keys")
     ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
@@ -265,17 +269,29 @@ if __name__ == "__main__":
         out["anytime"] = []
         saved_exit = (model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg)
         saved_ml, saved_mode = model.cfg.exit_min_layers, model.cfg.exit_mode
-        grid = [(p, u, bg, ml, md) for md in (a.sweep_mode or [saved_mode]) for ml in (a.sweep_min_layers or [saved_ml])
-                for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
-        for p, u, bg, ml, md in grid:
-            model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
-            model.cfg.exit_min_layers, model.cfg.exit_mode = ml, md
+        saved_pol = model.cfg.exit_policy
+        grid = []
+        for md in (a.sweep_mode or [saved_mode]):
+            for ml in (a.sweep_min_layers or [saved_ml]):
+                for pol in (a.sweep_policy or ["confidence"]):
+                    if pol == "random":
+                        grid += [(md, ml, pol, None, None, None, rp) for rp in a.sweep_random_p]
+                    else:
+                        grid += [(md, ml, pol, p, u, bg, None)
+                                 for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
+        for md, ml, pol, p, u, bg, rp in grid:
+            model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = ml, md, pol
+            if pol == "random":
+                model.cfg.exit_random_p = rp
+            else:
+                model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
             gc.collect()                                     # each config builds ~1.5M detection dicts; release before the next one
-            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md)
+            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md, policy=pol, random_p=rp)
             out["anytime"].append(r)
-            print(f"anytime mode={md} min_l={ml} p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
-        model.cfg.exit_min_layers, model.cfg.exit_mode = saved_ml, saved_mode
+            tag = f"random p={rp}" if pol == "random" else f"p={p} u={u} bg={bg}"
+            print(f"anytime mode={md} min_l={ml} {tag}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+        model.cfg.exit_min_layers, model.cfg.exit_mode, model.cfg.exit_policy = saved_ml, saved_mode, saved_pol
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = saved_exit      # restore --exit thresholds for --anytime / --latency-anytime
     if a.anytime:
         out["anytime_single"] = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
