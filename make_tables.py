@@ -51,10 +51,12 @@ ABLATIONS = [  # label, run dir
     ("deformable attention instead of RoI", "runs/abl_deform"),
     ("$-$ DINOv2 distillation init", "runs/abl_scratch"),
 ]
-RECIPE_AB = [  # label, run dir (10-epoch recipe check)
-    ("reference (lr 2e-3, fp16, distilled init)", "runs/ab_ref"),
+RECIPE_AB = [  # label, run dir (10-epoch recipe check at 416, batch 16, one change per row)
+    ("reference: lr 2e-3, fp16, distilled init", "runs/ab_ref"),
     ("lr 1e-3", "runs/ab_lr1e3"),
-    ("fp32", "runs/ab_fp32"),
+    ("lr 5e-4", "runs/ab_lr5e4"),
+    ("fp32 instead of fp16", "runs/ab_fp32"),
+    ("fp32, lr 1e-3", "runs/ab_fp32_lr1e3"),
     ("no distillation init", "runs/ab_noinit"),
 ]
 
@@ -91,6 +93,21 @@ def last_eval(run):
         return None
     ev = [json.loads(l) for l in open(p) if '"eval"' in l]
     return ev[-1] if ev else None
+
+
+def anytime_points(run):
+    """Every anytime measurement for a run, merged across eval.json and the extra sweep files, tagged with exit mode
+    and minimum depth (older files predate those fields: they used removal with a two-layer minimum)."""
+    import glob
+    pts, seen = [], set()
+    for path in sorted(glob.glob(f"{run}/eval*.json")):
+        jj = load(path)
+        for r in (jj or {}).get("anytime", []) or []:
+            r = dict(r); r.setdefault("mode", jj.get("exit_mode", "remove")); r.setdefault("min_layers", 2)
+            key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"])
+            if key not in seen:
+                seen.add(key); pts.append(r)
+    return pts
 
 
 def torch_ms(j, L=None):
@@ -167,9 +184,10 @@ def pareto(pts):
 
 
 # ------------------------------------------------------------------ anytime table + figure
-j_g, j_n = load("runs/kestrel_n/eval.json"), load("runs/kestrel_n/eval_nogate.json")
+MAIN = "runs/kestrel_n2" if os.path.exists("runs/kestrel_n2/eval.json") else "runs/kestrel_n"    # corrected-recipe run once it exists
+j_g, j_n = load(f"{MAIN}/eval.json"), load(f"{MAIN}/eval_nogate.json")
 j = j_n or j_g                                                     # headline anytime numbers: ungated if available
-t_n = load("runs/kestrel_n/trt.json")
+t_n = load(f"{MAIN}/trt.json")
 with open(P / "tables/anytime.tex", "w") as fh:
     fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{4pt}\n\\caption{\\textbf{Anytime decoding} of \\kestrel{}-N on VOC07 test" + (" (gate off)" if j_n else "") + ". Static: every query runs $\\ell$ layers. Anytime: per-query exit at the listed thresholds; depth is the mean number of decoder layers executed per query. Latency: batch~1 PyTorch eager on real images (median ms) and TensorRT FP16 engines of the corresponding static depth.}\\label{tab:anytime}\n")
     fh.write("\\begin{tabular}{llrrrrr}\\toprule\nMode & Setting & Depth & AP & AP$_{50}$ & torch ms & TRT ms \\\\\\midrule\n")
@@ -178,30 +196,33 @@ with open(P / "tables/anytime.tex", "w") as fh:
         for l in range(1, L + 1):
             r = j["full"] if l == L else j["static"][str(l)]
             fh.write(f"static & $\\ell={l}$ & {l:.2f} & {f(r['AP'])} & {f(r['AP50'])} & {f(torch_ms(j_g, l), 2)} & {f(trt_ms(t_n, l), 2)} \\\\\n")
-        fh.write("\\midrule\n")
-        pts = pareto(j.get("anytime", []))
-        for r in pts:
-            la = (j_g or {}).get("latency_anytime") or {}
-            same = la and abs(la.get("mean_depth", -9) - r["mean_exit_layer"]) < 0.15
-            fh.write(f"anytime & $\\tau_p{{=}}{r['exit_p']},\\tau_H{{=}}{r['exit_u']},\\tau_{{bg}}{{=}}{r['exit_bg']}$ & {r['mean_exit_layer']:.2f} & {f(r['AP'])} & {f(r['AP50'])} & {f(la.get('ms_median'), 2) if same else '--'} & -- \\\\\n")
+        allpts = anytime_points(MAIN)
+        for mode, tag in (("remove", "anytime, removal"), ("freeze", "anytime, frozen context")):
+            sel = [r for r in allpts if r.get("mode") == mode]
+            if not sel:
+                continue
+            fh.write("\\midrule\n")
+            for r in pareto(sel):
+                la = (j_g or {}).get("latency_anytime") or {}
+                same = la and mode == (j_g or {}).get("exit_mode", "remove") and abs(la.get("mean_depth", -9) - r["mean_exit_layer"]) < 0.15
+                fh.write(f"{tag} & $\\ell_{{\\min}}{{=}}{r.get('min_layers', 2)},\\tau_{{bg}}{{=}}{r['exit_bg']}$ & {r['mean_exit_layer']:.2f} & {f(r['AP'])} & {f(r['AP50'])} & {f(la.get('ms_median'), 2) if same else '--'} & -- \\\\\n")
     fh.write("\\bottomrule\\end{tabular}\\end{table}\n")
 
 try:
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(4.2, 3.0), dpi=200)
-    series = [(j, "\\kestrel{}-N, 80 ep" + (" (gate off)" if j_n else ""), "#2f4f9e"),
-              (load("runs/abl_full/eval.json"), "full, ablation schedule", "#5b7fd0"), (load("runs/abl_nogolsd/eval.json"), "no GO-LSD, ablation schedule", "#b9521a")]
-    for jj, name, c in series:
-        if not jj: continue
-        name = name.replace("\\kestrel{}", "KESTREL")
-        L = len(jj.get("static", {})) + 1
-        xs = list(range(1, L + 1)); ys = [jj["static"][str(l)]["AP"] if l < L else jj["full"]["AP"] for l in xs]
-        ax.plot(xs, ys, "s--", color=c, alpha=0.6, label=f"static, {name}")
-        pts = sorted(jj.get("anytime", []), key=lambda r: r["mean_exit_layer"])
-        ax.scatter([r["mean_exit_layer"] for r in pts], [r["AP"] for r in pts], s=6, color=c, alpha=0.25)
-        pa = pareto(pts)
-        if pa: ax.plot([r["mean_exit_layer"] for r in pa], [r["AP"] for r in pa], "o-", color=c, label=f"anytime, {name}")
-    ax.set_xlabel("mean decoder layers per query"); ax.set_ylabel("AP (VOC07 test)"); ax.grid(alpha=0.3); ax.legend(fontsize=6)
+    if j:
+        L = len(j.get("static", {})) + 1
+        xs = list(range(1, L + 1)); ys = [j["static"][str(l)]["AP"] if l < L else j["full"]["AP"] for l in xs]
+        ax.plot(xs, ys, "s--", color="#77818f", label="static truncation")
+        allpts = anytime_points(MAIN)
+        for mode, name, c in (("remove", "anytime, queries removed (as designed)", "#b9521a"), ("freeze", "anytime, frozen context (ours)", "#2f4f9e")):
+            sel = sorted([r for r in allpts if r.get("mode") == mode], key=lambda r: r["mean_exit_layer"])
+            if not sel: continue
+            ax.scatter([r["mean_exit_layer"] for r in sel], [r["AP"] for r in sel], s=7, color=c, alpha=0.3)
+            pa = pareto(sel)
+            ax.plot([r["mean_exit_layer"] for r in pa], [r["AP"] for r in pa], "o-", color=c, label=name)
+    ax.set_xlabel("mean decoder layers per query"); ax.set_ylabel("AP (VOC07 test)"); ax.grid(alpha=0.3); ax.legend(fontsize=6, loc="lower right")
     fig.tight_layout(); fig.savefig(P / "figures/anytime_curve.pdf"); plt.close(fig)
     # calibration figure
     fig, axs = plt.subplots(1, 2, figsize=(5.4, 2.6), dpi=200)
@@ -287,7 +308,8 @@ args = load("runs/kestrel_n/args.json"); macros["epochsMain"] = str(args["epochs
 aargs = load("runs/abl_full/args.json"); macros["epochsAbl"] = str(aargs["epochs"]) if aargs else "--"
 macros.setdefault("paramsN", "5.4"); macros.setdefault("gflopsN", "7.1"); macros.setdefault("paramsS", "13.0"); macros.setdefault("gflopsS", "17.3")
 macros["hardware"] = HW
-for k in ("mainResultText", "anytimeResultText", "calibResultText", "ablationResultText", "latencyResultText", "abstractResultText", "conclusionResultText", "gateResultText", "recipeResultText"):
+for k in ("mainResultText", "anytimeResultText", "calibResultText", "ablationResultText", "latencyResultText",
+          "abstractResultText", "conclusionResultText", "gateResultText", "recipeResultText", "costResultText"):
     macros.setdefault(k, "")
 prev = {}
 if (P / "results_macros.tex").exists():                     # keep hand-written result texts across regenerations

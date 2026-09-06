@@ -1,7 +1,8 @@
 """Train ultralytics baselines (YOLO26 / YOLO11 / YOLOv8 / RT-DETR) on VOC07+12 under the same data, image size,
 epoch budget and device as KESTREL. Usage: python baselines/train_yolo.py yolo26n.yaml --epochs 60 --imgsz 512"""
 import argparse
-import os, os, sys
+import fcntl
+import os, sys
 os.environ.setdefault("YOLO_AUTOINSTALL", "False")   # ultralytics must not pip-install (it once replaced torch)
 from ultralytics import YOLO, RTDETR
 
@@ -18,6 +19,13 @@ ap.add_argument("--resume", action="store_true")
 ap.add_argument("--amp", action="store_true", help="mixed precision (CUDA); off by default because MPS does not support it")
 a = ap.parse_args()
 name = a.name or a.cfg.replace(".yaml", "").replace(".pt", "") + ("_coco" if a.pretrained else "_scratch") + f"_{a.imgsz}_e{a.epochs}"
+# exclusive lock per run: several queues may drive this repo at once (see train.py)
+os.makedirs(f"runs/baselines/{name}", exist_ok=True)
+_lock = open(f"runs/baselines/{name}/.train.lock", "w")
+try:
+    fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print(f"another process is already training {name} (lock held); exiting"); sys.exit(0)
 cls = RTDETR if "rtdetr" in a.cfg else YOLO
 if a.resume and os.path.exists(f"runs/baselines/{name}/weights/last.pt"):
     model = cls(f"runs/baselines/{name}/weights/last.pt"); model.train(resume=True); sys.exit(0)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -103,6 +104,14 @@ def main():
     ap.add_argument("--presence-power", type=float, default=1.0, help="eval-time presence gate exponent (1 product, 0.5 geometric mean, 0 off)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    # Exclusive lock on the output directory: several experiment queues may be driving this repo at once, and two
+    # processes writing the same last.pt/best.pt would corrupt both. A duplicate start exits quietly instead.
+    _lock = open(os.path.join(a.out, ".train.lock"), "w")
+    try:
+        fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"another process is already training {a.out} (lock held); exiting"); return
+    _lock.write(f"{os.getpid()}\n"); _lock.flush()
     torch.manual_seed(a.seed); random.seed(a.seed); np.random.seed(a.seed)
     dev = torch.device(a.device)
 
