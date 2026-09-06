@@ -9,10 +9,8 @@ export PYTHONUNBUFFERED=1 YOLO_AUTOINSTALL=False PYTORCH_CUDA_ALLOC_CONF=expanda
 export LD_LIBRARY_PATH=$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs
 log() { echo "[$(date '+%F %T')] $*"; }
 # 1. every lane reports "done" in its own log
-for lane in kestrel yolo deep keydrop nogate dupes; do
-  until /usr/bin/grep -q "lane . done\|queue.* done" runs/queue5_$lane.log 2>/dev/null; do sleep 300; done
-  log "lane $lane finished"
-done
+until /usr/bin/grep -q "lane A done" runs/queue6_main.log 2>/dev/null; do sleep 300; done; log "lane A finished"
+until /usr/bin/grep -q "lane B done" runs/queue5_yolo.log 2>/dev/null; do sleep 300; done; log "lane B finished"
 # 2. and the GPU is genuinely quiet (a stray evaluation would corrupt the timings)
 while pgrep -f "python (train|evaluate|analysis|scripts/duplicate)" > /dev/null || pgrep -f "train_yolo|eval_yolo" > /dev/null; do sleep 120; done
 log "GPU idle — starting the latency pass"
