@@ -208,6 +208,8 @@ if __name__ == "__main__":
     ap.add_argument("--sweep-p", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8], help="foreground-exit thresholds for --anytime-sweep")
     ap.add_argument("--sweep-u", type=float, nargs="+", default=[0.10, 0.15, 0.20, 0.30], help="entropy thresholds for --anytime-sweep")
     ap.add_argument("--sweep-bg", type=float, nargs="+", default=[0.02, 0.05, 0.10], help="background-exit thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-min-layers", type=int, nargs="+", default=None, help="minimum layers before a query may exit (default: the model's setting)")
+    ap.add_argument("--sweep-mode", nargs="+", default=None, choices=["remove", "freeze"], help="exit modes to sweep (default: the model's setting)")
     ap.add_argument("--latency", action="store_true")
     ap.add_argument("--latency-anytime", action="store_true", help="batch-1 anytime latency on real images at the current cfg thresholds")
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
@@ -252,13 +254,17 @@ if __name__ == "__main__":
     if a.anytime_sweep:
         out["anytime"] = []
         saved_exit = (model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg)
-        grid = [(p, u, bg) for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
-        for p, u, bg in grid:
+        saved_ml, saved_mode = model.cfg.exit_min_layers, model.cfg.exit_mode
+        grid = [(p, u, bg, ml, md) for md in (a.sweep_mode or [saved_mode]) for ml in (a.sweep_min_layers or [saved_ml])
+                for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
+        for p, u, bg, ml, md in grid:
             model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
+            model.cfg.exit_min_layers, model.cfg.exit_mode = ml, md
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
-            r.update(exit_p=p, exit_u=u, exit_bg=bg)
+            r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md)
             out["anytime"].append(r)
-            print(f"anytime p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+            print(f"anytime mode={md} min_l={ml} p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")
+        model.cfg.exit_min_layers, model.cfg.exit_mode = saved_ml, saved_mode
         model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = saved_exit      # restore --exit thresholds for --anytime / --latency-anytime
     if a.anytime:
         out["anytime_single"] = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
