@@ -46,7 +46,7 @@ def build_model(name: str, num_classes: int = 20, **over) -> KESTREL:
 def load_checkpoint(path: str, device, ema: bool = True) -> Tuple[KESTREL, Dict]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     args = ck["args"]
-    over = {k: args[k] for k in ("dec_layers",) if args.get(k)}          # structural overrides recorded at training time
+    over = {k: args[k] for k in ("dec_layers", "key_dropout") if args.get(k)}          # structural overrides recorded at training time
     model = build_model(args["model"], 20, local_attn=args.get("local_attn", "roi"), use_presence=not args.get("no_presence", False),
                         fdr_scale=args.get("fdr_scale", 0.5), ls_init=args.get("ls_init", 1e-2), presence_power=args.get("presence_power", 1.0), **over)
     sd = ck["ema"] if (ema and "ema" in ck) else ck["model"]

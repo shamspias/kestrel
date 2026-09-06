@@ -88,6 +88,10 @@ class KestrelConfig:
                                                  # probability `exit_random_p` (a control that matches depth but ignores
                                                  # which query is which); "none": never exit
     exit_random_p: float = 0.5
+    key_dropout: float = 0.0                     # TRAINING: per layer, hide a random fraction (sampled in [0, key_dropout])
+                                                 # of queries from the decoder's self-attention keys, so the decoder sees a
+                                                 # varying peer-set size. Removing exited queries at inference is otherwise a
+                                                 # distribution shift the classification head was never trained for.
     exit_keys_kept: int = -1                      # analysis control for "remove" mode: how many randomly chosen exited
                                                  # queries stay visible as self-attention keys. <= 0 keeps none (plain
                                                  # removal); a positive value keeps that many; keeping all is exactly
@@ -739,6 +743,30 @@ class AnytimeDecoder(nn.Module):
     def qpos(self, boxes, img_hw):
         return self.pos_mlp(sine_embed(boxes_to_norm_cxcywh(boxes.detach(), img_hw)))
 
+    def key_dropout_mask(self, sa_mask, B: int, K: int, device):
+        """Training-time regularisation for anytime inference: hide a random subset of queries from this layer's
+        self-attention KEYS (they are still updated as queries). The drop fraction is resampled per layer and per image
+        from [0, cfg.key_dropout], so the decoder is trained across the whole range of peer-set sizes that per-query
+        exit produces at inference. Every query always keeps itself as a key, so no attention row is fully masked."""
+        p = self.cfg.key_dropout
+        if not self.training or p <= 0:
+            return sa_mask
+        frac = torch.rand(B, 1, device=device) * p
+        drop = torch.rand(B, K, device=device) < frac                       # (B, K) keys hidden this layer
+        m = drop[:, None, :].expand(B, K, K).clone()
+        i = torch.arange(K, device=device)
+        m[:, i, i] = False                                                  # a query can always attend to itself
+        h = self.cfg.dec_heads
+        m = m[:, None].expand(B, h, K, K).reshape(B * h, K, K)
+        if sa_mask is None:
+            return m
+        if sa_mask.shape[-1] != K:                                          # denoising queries are appended: pad to the full set
+            S = sa_mask.shape[-1]
+            full = sa_mask.new_zeros(B * h, S, S)
+            full[:, :K, :K] = m
+            return sa_mask | full
+        return sa_mask | m
+
     def kv_maps(self, feats):
         return [p(f) for p, f in zip(self.kv_proj, feats)]
 
@@ -749,7 +777,7 @@ class AnytimeDecoder(nn.Module):
         fdr_logits = q.new_zeros(B, K, 4, self.cfg.fdr_bins)
         boxes, outs = box_init, []
         for layer in self.layers[: max_layers or len(self.layers)]:
-            q = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, sa_mask)
+            q = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, self.key_dropout_mask(sa_mask, B, K, q.device))
             fdr_logits = fdr_logits + layer.delta_fdr(q).view(B, K, 4, -1)
             boxes = self.fdr.decode(fdr_logits, box_init)
             region = layer.region(q)

@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--fdr-scale", type=float, default=1.0, help="max edge offset as a fraction of the seed box side")
     ap.add_argument("--ls-init", type=float, default=1e-2, help="LayerScale init")
     ap.add_argument("--presence-power", type=float, default=1.0, help="eval-time presence gate exponent (1 product, 0.5 geometric mean, 0 off)")
+    ap.add_argument("--key-dropout", type=float, default=0.0, help="training-time self-attention key dropout in the decoder (0 = off); trains the decoder for the varying peer-set sizes that per-query exit produces")
     ap.add_argument("--dec-layers", type=int, default=None, help="override the preset's decoder depth (the anytime mechanism has more headroom the deeper the decoder is)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -136,6 +137,8 @@ def main():
 
     # ---------------- model / loss / optim
     over = dict(dec_layers=a.dec_layers) if a.dec_layers else {}
+    if a.key_dropout:
+        over["key_dropout"] = a.key_dropout
     model = build_model(a.model, 20, local_attn=a.local_attn, use_presence=not a.no_presence, fdr_scale=a.fdr_scale, ls_init=a.ls_init,
                         presence_power=a.presence_power, **over).to(dev)
     if a.init:
