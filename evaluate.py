@@ -163,8 +163,10 @@ def latency(model: KESTREL, device, size: int, n: int = 50, warm: int = 10, **kw
 
 @torch.no_grad()
 def latency_anytime(model: KESTREL, loader, device, n_images: int = 200, warm: int = 10):
-    """Batch-1 wall-clock of the anytime forward on real test images (the exit pattern depends on content)."""
+    """Batch-1 wall-clock of the anytime forward on real test images (the exit pattern depends on content).
+    Always times the sequential per-query implementation: the batched one is an accuracy-only equivalent."""
     model.eval()
+    saved_impl, model.cfg.anytime_batched = model.cfg.anytime_batched, False
     times, depths, k = [], [], 0
     for imgs, _, _, _ in loader:
         for i in range(imgs.shape[0]):
@@ -178,7 +180,9 @@ def latency_anytime(model: KESTREL, loader, device, n_images: int = 200, warm: i
             if k > warm:
                 times.append(1000 * dt); depths.append(out["exit_layer"].float().mean().item())
             if k >= n_images + warm:
+                model.cfg.anytime_batched = saved_impl
                 return dict(ms_mean=float(np.mean(times)), ms_median=float(np.median(times)), mean_depth=float(np.mean(depths)), n=len(times))
+    model.cfg.anytime_batched = saved_impl
     return dict(ms_mean=float(np.mean(times)), ms_median=float(np.median(times)), mean_depth=float(np.mean(depths)), n=len(times))
 
 
@@ -215,6 +219,7 @@ if __name__ == "__main__":
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
     ap.add_argument("--anytime", action="store_true", help="single anytime evaluation at --exit thresholds")
     ap.add_argument("--reparam", action="store_true", help="fold multi-branch convs before evaluating/timing")
+    ap.add_argument("--anytime-seq", action="store_true", help="score anytime with the sequential per-query pass (default: the equivalent batched pass, which is much faster)")
     ap.add_argument("--exit-mode", default=None, choices=["remove", "freeze"], help="anytime exit: remove exited queries from later layers (default) or keep them frozen as self-attention keys")
     ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
     ap.add_argument("--gate-sweep", action="store_true", help="also report full-depth AP for gate exponents 1, 0.5 and 0")
@@ -234,6 +239,7 @@ if __name__ == "__main__":
         model.cfg.presence_power = a.gate_power
     if a.exit_mode:
         model.cfg.exit_mode = a.exit_mode
+    model.cfg.anytime_batched = not a.anytime_seq
     out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
     out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, device=str(dev),
                gate_power=model.cfg.presence_power if model.cfg.use_presence else 0.0, exit_mode=model.cfg.exit_mode)

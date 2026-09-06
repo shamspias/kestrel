@@ -82,6 +82,8 @@ class KestrelConfig:
     exit_bg: float = 0.05                        # confident background
     exit_u: float = 0.15                         # normalised localisation entropy
     exit_min_layers: int = 2
+    anytime_batched: bool = False                # True: score the anytime policy with the fast masked batched pass
+                                                 # (identical outputs, no compute saving); False: the real sequential path
     exit_mode: str = "remove"                    # "remove": exited queries leave later layers entirely; "freeze": they stay as
                                                  # self-attention keys/values (frozen at their exit state) but are not recomputed
     # ablation / training switches
@@ -747,6 +749,46 @@ class AnytimeDecoder(nn.Module):
         return outs
 
     @torch.no_grad()
+    def forward_anytime_batched(self, q, box_init, feats, mem, mem_pos, img_hw) -> Dict[str, torch.Tensor]:
+        """Batched equivalent of `forward_anytime`, for ACCURACY evaluation only.
+
+        Every query is evaluated at every layer and the updates of already-exited queries are discarded, which
+        reproduces the sequential per-query exit exactly: an exited query's state is frozen either way, and in
+        "remove" mode the exited queries are additionally masked out as self-attention keys, which is what the
+        sequential path achieves by not passing them to the layer at all. It saves no compute -- use the
+        sequential path to measure latency -- but it is far faster to score a whole test set with."""
+        cfg, B, K, d = self.cfg, *q.shape
+        mem, kv = self.mem_proj(mem), self.kv_maps(feats)
+        fdr = q.new_zeros(B, K, 4, cfg.fdr_bins)
+        boxes, region = box_init.clone(), q.new_zeros(B, K, cfg.embed_dim)
+        exit_layer = torch.full((B, K), len(self.layers), dtype=torch.long, device=q.device)
+        active = torch.ones(B, K, dtype=torch.bool, device=q.device)
+        eye = torch.eye(K, dtype=torch.bool, device=q.device)
+        for li, layer in enumerate(self.layers):
+            if not active.any():
+                break
+            sa_mask = None
+            if cfg.exit_mode == "remove" and not active.all():
+                # hide exited queries as keys, but keep the diagonal so a fully exited image cannot produce NaN
+                dead = (~active)[:, None, :].expand(B, K, K) & ~eye[None]
+                sa_mask = dead[:, None].expand(B, cfg.dec_heads, K, K).reshape(B * cfg.dec_heads, K, K)
+            qn = layer(q, self.qpos(boxes, img_hw), boxes, kv, mem, mem_pos, sa_mask)
+            fdr_n = fdr + layer.delta_fdr(qn).view(B, K, 4, cfg.fdr_bins)
+            a1, a2 = active[..., None], active[..., None, None]
+            q = torch.where(a1, qn, q)
+            fdr = torch.where(a2, fdr_n, fdr)
+            boxes = torch.where(a1, self.fdr.decode(fdr, box_init), boxes)
+            region = torch.where(a1, layer.region(qn), region)
+            if li + 1 >= cfg.exit_min_layers:
+                p = self.vocab(region).sigmoid().amax(-1)
+                u = self.fdr.entropy(fdr)
+                done = active & (((p > cfg.exit_p) & (u < cfg.exit_u)) | (p < cfg.exit_bg))
+                exit_layer = torch.where(done, torch.full_like(exit_layer, li + 1), exit_layer)
+                active = active & ~done
+        return dict(q=q, boxes=boxes, fdr=fdr, region=region, logits=self.vocab(region),
+                    uncertainty=self.fdr.entropy(fdr), exit_layer=exit_layer)
+
+    @torch.no_grad()
     def forward_anytime(self, q, box_init, feats, mem, mem_pos, img_hw) -> Dict[str, torch.Tensor]:
         """Per-query early exit (batch element by batch element). A query leaves the refinement loop when it is
         confidently foreground with sharp edge distributions, or confidently background. Converged queries are
@@ -950,7 +992,8 @@ class KESTREL(nn.Module):
                                             dense_anchors=dense["anchors"], dense_strides=dense["strides"], query_idx=idx,
                                             init_logits=init_logits, box_init=box_init[:, :K])
         if anytime and not self.training and state is None:
-            final = self.decoder.forward_anytime(q, box_init, feats, mem, mem_pos, (H, W))
+            fn = self.decoder.forward_anytime_batched if self.cfg.anytime_batched else self.decoder.forward_anytime
+            final = fn(q, box_init, feats, mem, mem_pos, (H, W))
             out["exit_layer"] = final["exit_layer"]
         else:
             layers = self.decoder(q, box_init, feats, mem, mem_pos, (H, W), sa_mask, max_layers)
