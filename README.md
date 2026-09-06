@@ -122,12 +122,26 @@ is filled by `make_tables.py` as runs complete.
 The suite spans six YOLO generations at two parameter tiers plus RT-DETR, the transformer set-prediction
 family KESTREL itself belongs to. Run it with `bash scripts/queue_baselines_full.sh`.
 
-| Tier | Models | Matched to | Status |
-|---|---|---|---|
-| nano (2.1–4.5 M) | YOLO26n, YOLO11n, YOLO12n, YOLOv10n, YOLOv9t, YOLOv8n, YOLOv6n, YOLOv5n | KESTREL-N (5.31 M) | YOLO26n at epoch 50/80 (intermediate AP 39.04); rest queued |
-| transformer | RT-DETR-L (33 M) | KESTREL by *architecture*, not size — it has no nano/small variant | queued |
-| small (7.3–11.2 M) | YOLO26s, YOLO11s, YOLOv10s, YOLOv9s, YOLOv8s | KESTREL-S (13.0 M) | queued |
-| reference | YOLO26n, YOLO26s, COCO-pretrained | context only, **not** like-for-like | queued |
+| Model | Params | AP | AP50 | AP75 | Status |
+|---|---|---|---|---|---|
+| **YOLO26n** (end-to-end, scratch) | 2.51 M | **53.82** | **74.58** | **58.93** | complete, 80 ep |
+| KESTREL-N (for comparison, **wrong learning rate**) | 5.31 M | 45.71 | 67.07 | 49.33 | superseded; corrected run pending |
+
+> **Read this before quoting the table.** On today's numbers the YOLO26n baseline beats KESTREL-N by 8.1 AP
+> with 47 % of the parameters. Our KESTREL-N number comes from a run that used a learning rate the recipe
+> comparison later showed is ~2.2× worse at a short horizon; the corrected run is training now and should
+> close much of the gap, but whether it closes all of it is unknown and we do not assume it. **This
+> repository's contribution is the anytime analysis, not a state-of-the-art detector** — the findings above
+> are within-checkpoint comparisons and do not depend on the vehicle winning its benchmark.
+
+Remaining suite, all queued:
+
+| Tier | Models | Matched to |
+|---|---|---|
+| nano (2.1–4.5 M) | YOLO11n, YOLO12n, YOLOv10n, YOLOv9t, YOLOv8n, YOLOv6n, YOLOv5n | KESTREL-N (5.31 M) |
+| transformer | RT-DETR-L (33 M) | KESTREL by *architecture*, not size — it has no nano/small variant |
+| small (7.3–11.2 M) | YOLO26s, YOLO11s, YOLOv10s, YOLOv9s, YOLOv8s | KESTREL-S (13.0 M) |
+| reference | YOLO26n, YOLO26s, COCO-pretrained | context only, **not** like-for-like |
 
 The full suite is roughly 173 GPU-hours on one RTX 2080 Ti. It is ordered so that stopping at any point still
 leaves a coherent table, and `make_tables.py` fills rows as runs land.
