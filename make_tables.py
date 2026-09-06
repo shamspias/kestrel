@@ -309,7 +309,8 @@ aargs = load("runs/abl_full/args.json"); macros["epochsAbl"] = str(aargs["epochs
 macros.setdefault("paramsN", "5.4"); macros.setdefault("gflopsN", "7.1"); macros.setdefault("paramsS", "13.0"); macros.setdefault("gflopsS", "17.3")
 macros["hardware"] = HW
 for k in ("mainResultText", "anytimeResultText", "calibResultText", "ablationResultText", "latencyResultText",
-          "abstractResultText", "conclusionResultText", "gateResultText", "recipeResultText", "costResultText"):
+          "abstractResultText", "conclusionResultText", "gateResultText", "recipeResultText", "costResultText",
+          "staticLossText", "decShareText", "mechanismResultText", "reproText", "KeydropResultText"):
     macros.setdefault(k, "")
 prev = {}
 if (P / "results_macros.tex").exists():                     # keep hand-written result texts across regenerations

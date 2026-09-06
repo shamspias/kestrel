@@ -42,6 +42,15 @@ def load(p):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
+def get(d, *ks):
+    """Nested lookup that tolerates missing levels."""
+    for k in ks:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+    return d
+
+
 def pareto(points, x="mean_exit_layer", y="AP"):
     """Points that are not dominated: sorted by depth, keep each new best AP."""
     best, out = -1e9, []
@@ -189,8 +198,39 @@ def fig_calibration(runs=(("runs/kestrel_n2", "with GO-LSD", BLUE), ("runs/abl_n
     print(f"wrote figures/{out}")
 
 
+# ------------------------------------------------------------------ 5. the keys-kept control
+def fig_keys_kept(run="runs/kestrel_n", out="keys_kept.pdf"):
+    """AP against the number of exited queries retained as self-attention keys (chosen at random).
+
+    This is the mechanism figure: if removal hurt by destroying information the survivors need, retaining
+    arbitrary keys would not help. It recovers almost everything, so what matters is how many keys remain."""
+    j = load(f"{run}/eval_keys.json")
+    if not j or not j.get("anytime"):
+        print("skip keys_kept (no sweep yet)"); return
+    pts = sorted([r for r in j["anytime"] if r.get("keys_kept") is not None], key=lambda r: r["keys_kept"])
+    if len(pts) < 2:
+        print("skip keys_kept (need at least two points)"); return
+    xs = [r["keys_kept"] for r in pts]
+    ys = [r["AP"] for r in pts]
+    full = get(j, "full", "AP")
+    fig, ax = plt.subplots(figsize=(3.3, 2.4))
+    if full:
+        ax.axhline(full, color=INK2, lw=1.0, ls="--", zorder=2)
+        ax.text(xs[-1], full + 0.4, "full depth", ha="right", va="bottom", fontsize=6.5, color=INK2)
+    ax.plot(xs, ys, "o-", color=BLUE, lw=1.6, ms=4.5, mfc="white", mew=1.2, zorder=4)
+    for x, y in zip(xs, ys):
+        ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points", xytext=(0, 6), ha="center",
+                    fontsize=6.5, color=INK)
+    ax.set_xlabel("exited queries retained as attention keys (chosen at random)")
+    ax.set_ylabel("AP (VOC07 test)")
+    ax.grid(axis="y", alpha=0.8, zorder=0)
+    fig.savefig(P / "figures" / out); plt.close(fig)
+    print(f"wrote figures/{out}")
+
+
 if __name__ == "__main__":
     fig_anytime()
     fig_decoder_share()
     fig_depth_difficulty()
     fig_calibration()
+    fig_keys_kept()
