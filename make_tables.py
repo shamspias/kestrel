@@ -95,7 +95,7 @@ def last_eval(run):
     return ev[-1] if ev else None
 
 
-def anytime_points(run, full_only=True, bg_only=True):
+def anytime_points(run, full_only=True, bg_only=True, keep_policies=False):
     """Every anytime measurement for a run, merged across eval.json and the extra sweep files, tagged with exit mode
     and minimum depth (older files predate those fields: they used removal with a two-layer minimum).
 
@@ -109,8 +109,11 @@ def anytime_points(run, full_only=True, bg_only=True):
     for path in sorted(glob.glob(f"{run}/eval*.json")):
         jj = load(path)
         for r in (jj or {}).get("anytime", []) or []:
-            if r.get("keys_kept", -1) not in (-1, None) or r.get("policy", "confidence") != "confidence":
-                continue                                       # control experiments belong to their own analyses
+            if r.get("keys_kept", -1) not in (-1, None):
+                continue                                       # the keys-kept control has its own analysis
+            if not keep_policies and r.get("policy", "confidence") != "confidence":
+                continue                                       # tables report the confidence rule; the figure
+                                                               # also draws the random control
             if bg_only and (r.get("exit_p") is not None and r["exit_p"] <= 1.0):
                 continue                                       # the reported curve disables the foreground rule
                                                                # (tau_p > 1); mixing in entropy-rule points would
@@ -132,7 +135,8 @@ def anytime_points(run, full_only=True, bg_only=True):
         if keep_gate is not None and r["gate_power"] != keep_gate:
             skipped += 1
             continue
-        key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"], r["gate_power"])
+        key = (r["mode"], r["min_layers"], r["exit_p"], r["exit_u"], r["exit_bg"], r["gate_power"],
+               r.get("policy", "confidence"), r.get("random_p"))
         if key not in seen:
             seen.add(key); pts.append(r)
     if skipped:

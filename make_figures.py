@@ -62,10 +62,14 @@ def pareto(points, x="mean_exit_layer", y="AP"):
 
 # ------------------------------------------------------------------ 1. anytime curve
 def fig_anytime(run="runs/kestrel_n2", fallback="runs/kestrel_n", out="anytime_curve.pdf"):
+    from make_tables import anytime_points                  # one vetted merge, shared with the tables
     j = load(f"{run}/eval.json") or load(f"{fallback}/eval.json")
-    if not j or not j.get("anytime"):
-        print("skip anytime_curve (no anytime sweep yet)"); return
+    if not j:
+        print("skip anytime_curve (no eval yet)"); return
     tag = run if load(f"{run}/eval.json") else fallback
+    j = dict(j); j["anytime"] = anytime_points(tag, keep_policies=True)
+    if not j["anytime"]:
+        print("skip anytime_curve (no comparable anytime points)"); return
     L = len(j.get("static", {})) + 1
     fig, ax = plt.subplots(figsize=(3.3, 2.5))
 
@@ -75,16 +79,21 @@ def fig_anytime(run="runs/kestrel_n2", fallback="runs/kestrel_n", out="anytime_c
             label="static truncation (all queries)", zorder=2)
 
     pts = j["anytime"]
-    modes = [m for m in ("freeze", "remove") if any(r.get("mode") == m for r in pts)] or [None]
-    for mode, colour in zip(modes, (BLUE, ORANGE)):
-        sel = [r for r in pts if r.get("mode") == mode] if mode else pts
+    # one line per (mode, policy): the confidence rule helps under freezing and hurts under removal, so the
+    # two must never be averaged into a single "anytime" curve
+    series = [(m, pol, c, ls) for (m, pol, c, ls) in
+              (("freeze", "confidence", BLUE, "-"), ("freeze", "random", BLUE, ":"),
+               ("remove", "confidence", ORANGE, "-"), ("remove", "random", ORANGE, ":"))
+              if any(r.get("mode") == m and r.get("policy", "confidence") == pol for r in pts)] or [(None, None, BLUE, "-")]
+    for mode, pol, colour, ls in series:
+        sel = [r for r in pts if r.get("mode") == mode and r.get("policy", "confidence") == pol] if mode else pts
         ax.scatter([r["mean_exit_layer"] for r in sel], [r["AP"] for r in sel], s=7, color=colour,
                    alpha=0.30, linewidths=0, zorder=3)
         pa = pareto(sel)
-        lbl = {"freeze": "anytime, exited queries frozen", "remove": "anytime, exited queries removed",
-               None: "anytime"}[mode]
-        ax.plot([r["mean_exit_layer"] for r in pa], [r["AP"] for r in pa], "o-", color=colour, lw=1.6,
-                ms=4.5, mfc="white", mew=1.2, label=lbl, zorder=4)
+        base = {"freeze": "frozen", "remove": "removed", None: "anytime"}[mode]
+        lbl = base if mode is None else f"{base}, {pol}"
+        ax.plot([r["mean_exit_layer"] for r in pa], [r["AP"] for r in pa], marker="o", ls=ls, color=colour,
+                lw=1.6, ms=4.5, mfc="white", mew=1.2, label=lbl, zorder=4)
 
     ax.set_xlabel("mean decoder layers executed per query")
     ax.set_ylabel("AP (VOC07 test)")
