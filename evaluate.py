@@ -205,6 +205,9 @@ if __name__ == "__main__":
     ap.add_argument("--subset", type=int, default=None)
     ap.add_argument("--static-sweep", action="store_true", help="AP for max_layers = 1..L")
     ap.add_argument("--anytime-sweep", action="store_true", help="AP vs mean depth over exit thresholds")
+    ap.add_argument("--sweep-p", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8], help="foreground-exit thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-u", type=float, nargs="+", default=[0.10, 0.15, 0.20, 0.30], help="entropy thresholds for --anytime-sweep")
+    ap.add_argument("--sweep-bg", type=float, nargs="+", default=[0.02, 0.05, 0.10], help="background-exit thresholds for --anytime-sweep")
     ap.add_argument("--latency", action="store_true")
     ap.add_argument("--latency-anytime", action="store_true", help="batch-1 anytime latency on real images at the current cfg thresholds")
     ap.add_argument("--exit", type=float, nargs=3, default=None, metavar=("P", "U", "BG"), help="exit thresholds for --latency-anytime / --anytime")
@@ -246,7 +249,7 @@ if __name__ == "__main__":
     if a.anytime_sweep:
         out["anytime"] = []
         saved_exit = (model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg)
-        grid = [(p, u, bg) for p in (0.5, 0.6, 0.7, 0.8) for u in (0.10, 0.15, 0.20, 0.30) for bg in (0.02, 0.05, 0.10)]
+        grid = [(p, u, bg) for p in a.sweep_p for u in a.sweep_u for bg in a.sweep_bg]
         for p, u, bg in grid:
             model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
