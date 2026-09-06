@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import io
 import json
 import math
@@ -209,6 +210,7 @@ if __name__ == "__main__":
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--subset", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=2, help="test dataloader workers (keep low: workers fork the parent, and several jobs share this host)")
     ap.add_argument("--static-sweep", action="store_true", help="AP for max_layers = 1..L")
     ap.add_argument("--anytime-sweep", action="store_true", help="AP vs mean depth over exit thresholds")
     ap.add_argument("--sweep-p", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8], help="foreground-exit thresholds for --anytime-sweep")
@@ -231,7 +233,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     dev = torch.device(a.device)
     model, ck = load_checkpoint(a.ckpt, dev)
-    loader, gt_path, id_map, recs = build_test(a.size, subset=a.subset)
+    loader, gt_path, id_map, recs = build_test(a.size, subset=a.subset, workers=a.workers)
     L = model.cfg.dec_layers
     if a.reparam:
         model.reparameterize()
@@ -269,6 +271,7 @@ if __name__ == "__main__":
             model.cfg.exit_p, model.cfg.exit_u, model.cfg.exit_bg = p, u, bg
             model.cfg.exit_min_layers, model.cfg.exit_mode = ml, md
             r = run_eval(model, loader, gt_path, id_map, recs, dev, anytime=True)
+            gc.collect()                                     # each config builds ~1.5M detection dicts; release before the next one
             r.update(exit_p=p, exit_u=u, exit_bg=bg, min_layers=ml, mode=md)
             out["anytime"].append(r)
             print(f"anytime mode={md} min_l={ml} p={p} u={u} bg={bg}: AP {r['AP']:.2f} mean depth {r['mean_exit_layer']:.2f} hist {r['exit_hist']}")

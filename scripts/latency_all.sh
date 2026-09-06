@@ -13,7 +13,9 @@ fi
 # TensorRT engines take 10-15 min each to build on this GPU, so: all depths for the main models, final depth only for the
 # two ablations whose deployment graph differs (RoI vs deformable), none for the rest (same graph as abl_full).
 lat() { run=$1; sz=$2; trt=${3:-none}; [ -f runs/$run/best.pt ] || { log "skip $run"; return; }
-  log "latency $run @ $sz (torch)"; python evaluate.py --ckpt runs/$run/best.pt --size $sz --device cuda --reparam --update --skip-full --latency --latency-anytime --exit $EXIT --out runs/$run/eval.json > runs/$run/latency.log 2>&1
+  # static-depth ladder + anytime wall-clock in BOTH exit modes (removal vs frozen context) at the same thresholds
+  log "latency $run @ $sz (torch, static + anytime remove)"; python evaluate.py --ckpt runs/$run/best.pt --size $sz --device cuda --reparam --workers 1 --update --skip-full --latency --latency-anytime --exit-mode remove --exit $EXIT --out runs/$run/eval.json > runs/$run/latency.log 2>&1
+  log "latency $run @ $sz (torch, anytime freeze)"; python evaluate.py --ckpt runs/$run/best.pt --size $sz --device cuda --reparam --workers 1 --update --skip-full --latency-anytime --exit-mode freeze --exit $EXIT --out runs/$run/eval_lat_freeze.json >> runs/$run/latency.log 2>&1
   [ "$trt" = none ] && return
   log "latency $run @ $sz (TensorRT, $trt)"; python scripts/trt_latency.py kestrel --ckpt runs/$run/best.pt --size $sz $([ "$trt" = all ] && echo --all-depths) --out runs/$run/trt.json > runs/$run/trt.log 2>&1 || log "  TensorRT failed for $run (see runs/$run/trt.log)"; }
 latb() { name=$1; w=runs/baselines/$name/weights/best.pt; [ -f $w ] || { log "skip $name"; return; }
