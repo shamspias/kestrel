@@ -25,14 +25,29 @@ MAIN_RUNS = [  # (label, run dir, gate exponent to report: 1.0 = product gate as
     ("\\kestrel{}-S (gate off)", "runs/kestrel_s", 0.0),
 ]
 BASELINES = [
-    ("YOLO26n (end-to-end, scratch)", "yolo26n_scratch"),
-    ("YOLO26n (NMS path, scratch)", "yolo26n_scratch_nms"),
-    ("YOLO11n (NMS, scratch)", "yolo11n_scratch"),
-    ("YOLO12n (NMS, scratch)", "yolo12n_scratch"),
-    ("YOLOv10n (end-to-end, scratch)", "yolov10n_scratch"),
-    ("YOLOv9t (NMS, scratch)", "yolov9t_scratch"),
-    ("YOLOv8n (NMS, scratch)", "yolov8n_scratch"),
-    ("YOLO26n (COCO-pretrained, ref.)", "yolo26n_coco"),
+    # (label, run name). Grouped into tiers; a tier separator is drawn wherever the tier changes.
+    # tier 1 -- nano dense detectors, parameter-matched to KESTREL-N (5.31 M)
+    ("nano", "YOLO26n (end-to-end)", "yolo26n_scratch"),
+    ("nano", "YOLO26n (NMS path)", "yolo26n_scratch_nms"),
+    ("nano", "YOLO11n", "yolo11n_scratch"),
+    ("nano", "YOLO12n", "yolo12n_scratch"),
+    ("nano", "YOLOv10n (end-to-end)", "yolov10n_scratch"),
+    ("nano", "YOLOv9t", "yolov9t_scratch"),
+    ("nano", "YOLOv8n", "yolov8n_scratch"),
+    ("nano", "YOLOv6n", "yolov6n_scratch"),
+    ("nano", "YOLOv5n", "yolov5n_scratch"),
+    # tier 2 -- transformer set prediction: the family KESTREL belongs to. NOT parameter-matched; see caption.
+    ("detr", "RT-DETR-L", "rtdetrl_scratch"),
+    # tier 3 -- small dense detectors, parameter-matched to KESTREL-S (13.0 M)
+    ("small", "YOLO26s (end-to-end)", "yolo26s_scratch"),
+    ("small", "YOLO26s (NMS path)", "yolo26s_scratch_nms"),
+    ("small", "YOLO11s", "yolo11s_scratch"),
+    ("small", "YOLOv10s (end-to-end)", "yolov10s_scratch"),
+    ("small", "YOLOv9s", "yolov9s_scratch"),
+    ("small", "YOLOv8s", "yolov8s_scratch"),
+    # tier 4 -- COCO-pretrained reference rows: context only, NOT a like-for-like comparison
+    ("ref", "YOLO26n (COCO-pretrained)", "yolo26n_coco"),
+    ("ref", "YOLO26s (COCO-pretrained)", "yolo26s_coco"),
 ]
 # Published COCO val2017 numbers (author-reported; T4 TensorRT FP16 batch 1) for context only — not the same data,
 # hardware or schedule as our VOC experiments. Sources: the models' papers / READMEs as compiled in the design survey.
@@ -175,15 +190,19 @@ for label, d, gate in MAIN_RUNS:
         rows.append((label, j["params_M"], r["AP"], r["AP50"], r["AP75"], r["APs"], r["APm"], r["APl"], torch_ms(j), trt_ms(t)))
     else:
         rows.append((label, None, None, None, None, None, None, None, None, None))
-for label, name in BASELINES:
+prev_tier, tier_breaks = None, set()
+for tier, label, name in BASELINES:
     j, t = load(f"runs/baselines/{name}.json"), load(f"runs/baselines/{name.replace('_nms', '')}.trt.json")
+    if tier != prev_tier and prev_tier is not None:
+        tier_breaks.add(len(rows))
+    prev_tier = tier
     rows.append((label, j and j.get("params_M"), *(j and (j["AP"], j["AP50"], j["AP75"], j["APs"], j["APm"], j["APl"]) or (None,) * 6),
                  j and j.get("latency_ms_raw"), trt_ms(t)))
 with open(P / "tables/main.tex", "w") as fh:
-    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{3.5pt}\n\\caption{\\textbf{VOC07 test.} All models trained from scratch on VOC07+12 trainval at $512^2$ for \\epochsMain{} epochs on one " + HW + ", scored by the same pycocotools script. Latency is batch~1 at $512^2$ on the same GPU: PyTorch eager fp32 (median over real test images) and TensorRT FP16 with CUDA-graph replay (median of 200 passes; NMS excluded for the NMS-based YOLOs, nothing excluded for the end-to-end models). The COCO-pretrained row is a reference, not a like-for-like comparison.}\\label{tab:main}\n")
+    fh.write("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{3.5pt}\n\\caption{\\textbf{VOC07 test.} All models trained from scratch on VOC07+12 trainval at $512^2$ for \\epochsMain{} epochs on one " + HW + ", scored by the same pycocotools script. Latency is batch~1 at $512^2$ on the same GPU: PyTorch eager fp32 (median over real test images) and TensorRT FP16 with CUDA-graph replay (median of 200 passes; NMS excluded for the NMS-based YOLOs, nothing excluded for the end-to-end models). Baselines are grouped by parameter tier: nano models comparable to \\kestrel{}-N, then RT-DETR-L, then small models comparable to \\kestrel{}-S, then COCO-pretrained reference rows. RT-DETR-L is the only transformer set-prediction baseline this implementation offers and has no nano or small variant, so it is matched to \\kestrel{} by architecture rather than by size --- read its parameter count. The COCO-pretrained rows are context, not a like-for-like comparison.}\\label{tab:main}\n")
     fh.write("\\begin{tabular}{lrrrrrrrrr}\\toprule\nModel & Params (M) & AP & AP$_{50}$ & AP$_{75}$ & AP$_S$ & AP$_M$ & AP$_L$ & torch ms & TRT ms \\\\\\midrule\n")
     for i, r in enumerate(rows):
-        if i == len(MAIN_RUNS):
+        if i == len(MAIN_RUNS) or i in tier_breaks:
             fh.write("\\midrule\n")
         fh.write(f"{r[0]} & {f(r[1], 2)} & {f(r[2])} & {f(r[3])} & {f(r[4])} & {f(r[5])} & {f(r[6])} & {f(r[7])} & {f(r[8], 2)} & {f(r[9], 2)} \\\\\n")
     fh.write("\\bottomrule\\end{tabular}\\end{table}\n")
@@ -329,7 +348,7 @@ with open(P / "tables/latency.tex", "w") as fh:
             fh.write(f"{name} & static $\\ell={l}$ & {l} & {f(torch_ms(jj, l), 2)} & {f(trt_ms(tt, l, graph=False), 2)} & {f(trt_ms(tt, l), 2)} \\\\\n")
         la = jj.get("latency_anytime") or {}
         fh.write(f"{name} & anytime & {f(la.get('mean_depth'), 2)} & {f(la.get('ms_median'), 2)} & -- & -- \\\\\n")
-    for label, bname in BASELINES:
+    for _tier, label, bname in BASELINES:
         if bname.endswith("_nms"):
             continue
         jj, tt = load(f"runs/baselines/{bname}.json"), load(f"runs/baselines/{bname}.trt.json")

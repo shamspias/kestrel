@@ -119,11 +119,17 @@ the headroom an anytime policy could reclaim.
 Trained under identical conditions (same data, size, epochs, GPU, evaluator). **Still training**; this table
 is filled by `make_tables.py` as runs complete.
 
-| Model | Params | AP | AP50 | Status |
-|---|---|---|---|---|
-| YOLO26n (end-to-end, scratch) | 2.51 M | 39.04 | 59.09 | epoch 40/80, intermediate |
-| YOLO11n, YOLO12n, YOLOv10n, YOLOv9t, YOLOv8n | | | | queued |
-| YOLO26n (COCO-pretrained, reference) | | | | queued |
+The suite spans six YOLO generations at two parameter tiers plus RT-DETR, the transformer set-prediction
+family KESTREL itself belongs to. Run it with `bash scripts/queue_baselines_full.sh`.
+
+| Tier | Models | Matched to | Status |
+|---|---|---|---|
+| nano (2.1–4.5 M) | YOLO26n, YOLO11n, YOLO12n, YOLOv10n, YOLOv9t, YOLOv8n, YOLOv6n, YOLOv5n | KESTREL-N (5.31 M) | YOLO26n at epoch 50/80 (intermediate AP 39.04); rest queued |
+| transformer | RT-DETR-L (33 M) | KESTREL by *architecture*, not size — it has no nano/small variant | queued |
+| small (7.3–11.2 M) | YOLO26s, YOLO11s, YOLOv10s, YOLOv9s, YOLOv8s | KESTREL-S (13.0 M) | queued |
+| reference | YOLO26n, YOLO26s, COCO-pretrained | context only, **not** like-for-like | queued |
+
+Both the end-to-end and the NMS decoding paths are scored for YOLO26 and YOLOv10.
 
 ---
 
