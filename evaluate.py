@@ -231,6 +231,7 @@ if __name__ == "__main__":
     ap.add_argument("--sweep-random-p", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9],
                     help="per-layer exit probability for the random control")
     ap.add_argument("--anytime-seq", action="store_true", help="score anytime with the sequential per-query pass (default: the equivalent batched pass, which is much faster)")
+    ap.add_argument("--exit-min-layers", type=int, default=None, help="minimum layers before a query may exit, for --anytime / --latency-anytime (the reported operating points use 1)")
     ap.add_argument("--exit-mode", default=None, choices=["remove", "freeze"], help="anytime exit: remove exited queries from later layers (default) or keep them frozen as self-attention keys")
     ap.add_argument("--gate-power", type=float, default=None, help="presence gate exponent for all evaluations (1 = product, 0.5 = geometric mean, 0 = off); default: checkpoint setting")
     ap.add_argument("--gate-sweep", action="store_true", help="also report full-depth AP for gate exponents 1, 0.5 and 0")
@@ -250,6 +251,8 @@ if __name__ == "__main__":
         model.cfg.presence_power = a.gate_power
     if a.exit_mode:
         model.cfg.exit_mode = a.exit_mode
+    if a.exit_min_layers:
+        model.cfg.exit_min_layers = a.exit_min_layers
     model.cfg.anytime_batched = not a.anytime_seq
     out = json.load(open(a.out)) if (a.update and a.out and os.path.exists(a.out)) else {}
     out.update(ckpt=a.ckpt, params_M=count_params(model) / 1e6, epoch=ck.get("epoch"), exit=a.exit or out.get("exit"), size=a.size, subset=a.subset, device=str(dev),
@@ -310,6 +313,8 @@ if __name__ == "__main__":
         print("latency ms (batch 1, random):", out["latency_ms"]); print("latency ms (batch 1, images):", out["latency_ms_images"])
     if a.latency_anytime:
         out["latency_anytime"] = latency_anytime(model, loader, dev)
+        out["latency_anytime"].update(mode=model.cfg.exit_mode, min_layers=model.cfg.exit_min_layers, policy=model.cfg.exit_policy,
+                                      exit_p=model.cfg.exit_p, exit_u=model.cfg.exit_u, exit_bg=model.cfg.exit_bg)
         print("anytime latency:", out["latency_anytime"])
     if a.out:
         json.dump(out, open(a.out, "w"), indent=1)
